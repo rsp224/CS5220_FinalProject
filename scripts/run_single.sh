@@ -1,3 +1,7 @@
 #!/bin/bash
 
-./build/train_single
+set -e
+
+cd "$(dirname "$0")/.."
+
+./build/train_single train data
