@@ -44,6 +44,31 @@ target_link_libraries(train_single PUBLIC
 if (USE_MPI)
     find_package(MPI REQUIRED)
 
+    set(NCCL_ROOT "" CACHE PATH "Root of extracted NCCL tarball")
+
+    find_path(NCCL_INCLUDE_DIR
+    NAMES nccl.h
+    HINTS
+        ${NCCL_ROOT}/include
+    )
+
+    find_library(NCCL_LIBRARY
+    NAMES nccl
+    HINTS
+        ${NCCL_ROOT}/lib
+        ${NCCL_ROOT}/lib64
+    )
+
+    include(FindPackageHandleStandardArgs)
+    find_package_handle_standard_args(NCCL DEFAULT_MSG
+    NCCL_INCLUDE_DIR NCCL_LIBRARY)
+    
+    add_library(NCCL::NCCL UNKNOWN IMPORTED)
+    set_target_properties(NCCL::NCCL PROPERTIES
+    IMPORTED_LOCATION "${NCCL_LIBRARY}"
+    INTERFACE_INCLUDE_DIRECTORIES "${NCCL_INCLUDE_DIR}"
+    )
+
     add_executable(train_dist
         src/main_dist.cpp
         src/MNIST.cpp
@@ -62,5 +87,6 @@ if (USE_MPI)
         CUDA::cudart
         CUDA::cublas
         MPI::MPI_CXX
+        NCCL::NCCL
     )
 endif ()
