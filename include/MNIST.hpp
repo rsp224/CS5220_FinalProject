@@ -43,4 +43,6 @@ private:
 
     std::vector<float> last_image_;
     std::vector<float> last_label_;
+
+    friend class DistributedDataLoader;
 };

@@ -30,6 +30,7 @@ add_executable(train_single
     src/cuda/FFLayer.cu
     src/cuda/CCELoss.cu
     src/cuda/SGDOptimizer.cu
+    src/Stream.cpp
 )
 
 target_include_directories(train_single PUBLIC
@@ -73,6 +74,8 @@ if (USE_MPI)
         src/main_dist.cpp
         src/MNIST.cpp
         src/Model.cpp
+        src/Stream.cpp
+        src/DistributedDataLoader.cpp
         src/cuda/Tensor.cu
         src/cuda/FFLayer.cu
         src/cuda/CCELoss.cu

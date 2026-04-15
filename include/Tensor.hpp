@@ -33,6 +33,8 @@ public:
     std::size_t size() const noexcept;
     std::size_t bytes() const noexcept;
 
+    void div(float scalar);
+
 private:
     void free();
 

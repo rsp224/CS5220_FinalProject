@@ -19,11 +19,6 @@ Model::Model(int input_dim, int hidden_dim, int output_dim, int batch_size)
       grad_hidden_(batch_size, hidden_dim) {}
 
 void Model::init(unsigned int seed) {
-    if (seed == 0) {
-        std::random_device rd;
-        seed = rd();
-    }
-
     layer1_.init(seed + 1);
     layer2_.init(seed + 2);
 }

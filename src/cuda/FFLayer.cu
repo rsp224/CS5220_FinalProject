@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include "Stream.hpp"
 
 namespace {
 
@@ -29,6 +30,8 @@ cublasHandle_t get_cublas_handle() {
 
     if (!initialized) {
         check_cublas(cublasCreate(&handle), "cublasCreate failed");
+        cudaStream_t stream = get_cuda_stream();
+        cublasSetStream(handle, stream);
         initialized = true;
     }
     return handle;
