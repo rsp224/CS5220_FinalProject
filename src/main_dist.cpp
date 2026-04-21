@@ -8,6 +8,7 @@
 #include <nccl.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <cstdlib>
 
 #define MPICHECK(cmd)                                                          \
     do {                                                                       \
@@ -44,8 +45,8 @@ static constexpr int hidden_dim = 32;
 static constexpr int output_dim = 10;
 static constexpr int num_epochs = 5;
 
-Model create_model(int rank, unsigned int seed = 0) {
-    Model model(input_dim, hidden_dim, output_dim, batch_size);
+Model create_model(int rank, int local_batch_size, unsigned int seed = 0) {
+    Model model(input_dim, hidden_dim, output_dim, local_batch_size);
     // only initialize on rank 0 and broadcast model params to others
     if (rank == 0) {
         model.init(seed);
@@ -76,10 +77,10 @@ void train(int rank, int world_size, const char *data_dir,
     MNIST train_data(base + "/train-images-idx3-ubyte",
                      base + "/train-labels-idx1-ubyte");
 
-    Model model = create_model(rank, 42);
     SGDOptimizer optimizer(0.3f);
 
     const int local_batch_size = batch_size / world_size;
+    Model model = create_model(rank, local_batch_size, 42);
 
     std::vector<float> host_images, host_labels;
 
@@ -191,7 +192,12 @@ int main(int argc, char **argv) {
 
     // Slurm should already handle GPU assignment where it assigns one GPU per
     // rank
-    CUDACHECK(cudaSetDevice(0));
+    int local_rank = 0;
+    const char* local_rank_env = std::getenv("SLURM_LOCALID");
+    if (local_rank_env != nullptr) {
+        local_rank = std::atoi(local_rank_env);
+    }
+    CUDACHECK(cudaSetDevice(local_rank));
     // Warm up the lazy stream singleton so NCCL and kernels share it.
     (void)get_cuda_stream();
 

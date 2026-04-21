@@ -17,28 +17,31 @@ add_compile_options(-O3 -Wall -Wextra)
 find_package(CUDAToolkit REQUIRED)
 
 option(USE_MPI "Build distributed executable with MPI" OFF)
+
 set(CRAY_CUDA_AWARE_MPI_TARGET "nvidia80" CACHE STRING
     "Cray accelerator target used to link the CUDA-aware MPI GTL library")
 
 if (NOT "${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU")
     message(WARNING
-            "Recommended to use PrgEnv-gnu on Perlmutter for this project.")
+        "Recommended to use PrgEnv-gnu on Perlmutter for this project.")
 endif ()
 
-add_executable(train_single
-    src/main.cpp
+set(COMMON_SOURCES
     src/MNIST.cpp
     src/Model.cpp
+    src/Stream.cpp
     src/cuda/Tensor.cu
     src/cuda/FFLayer.cu
     src/cuda/CCELoss.cu
     src/cuda/SGDOptimizer.cu
-    src/Stream.cpp
 )
 
-target_include_directories(train_single PRIVATE
-    include
+add_executable(train_single
+    src/main.cpp
+    ${COMMON_SOURCES}
 )
+
+target_include_directories(train_single PRIVATE include)
 
 target_link_libraries(train_single PRIVATE
     CUDA::cudart
@@ -50,11 +53,10 @@ if (USE_MPI)
 
     if (NOT CMAKE_CXX_COMPILER MATCHES "(/|^)CC$")
         message(WARNING
-                "Distributed GPU builds on Perlmutter are best configured with the Cray C++ wrapper `CC`.\n"
-                "That is the most reliable way to get MPI plus the CUDA GTL library linked correctly.\n"
-                "Recommended configure command:\n"
-                "  module load cudatoolkit nccl craype-accel-nvidia80\n"
-                "  cmake -S . -B build-dist -DUSE_MPI=ON -DCMAKE_CXX_COMPILER=$(which CC)")
+            "Distributed GPU builds on Perlmutter are best configured with the Cray C++ wrapper `CC`.\n"
+            "Recommended configure command:\n"
+            "  module load cudatoolkit nccl craype-accel-nvidia80\n"
+            "  cmake -S . -B build -DUSE_MPI=ON -DCMAKE_CXX_COMPILER=$(which CC)")
     endif ()
 
     set(NCCL_ROOT "" CACHE PATH "Root of the NCCL installation")
@@ -90,22 +92,12 @@ if (USE_MPI)
 
     add_executable(train_dist
         src/main_dist.cpp
-        src/MNIST.cpp
-        src/Model.cpp
-        src/Stream.cpp
         src/DistributedDataLoader.cpp
-        src/cuda/Tensor.cu
-        src/cuda/FFLayer.cu
-        src/cuda/CCELoss.cu
-        src/cuda/SGDOptimizer.cu
+        ${COMMON_SOURCES}
     )
 
-    target_include_directories(train_dist PRIVATE
-        include
-    )
+    target_include_directories(train_dist PRIVATE include)
 
-    # On Perlmutter, CUDA-aware MPI requires the GTL library to be linked.
-    # The Cray wrapper can add it automatically when the accelerator target is set.
     if (CMAKE_CXX_COMPILER MATCHES "(/|^)CC$")
         target_compile_options(train_dist PRIVATE
             $<$<COMPILE_LANGUAGE:CXX>:-target-accel=${CRAY_CUDA_AWARE_MPI_TARGET}>
@@ -123,8 +115,8 @@ if (USE_MPI)
             target_link_libraries(train_dist PRIVATE "${MPI_GTL_CUDA_LIBRARY}")
         else ()
             message(WARNING
-                    "Could not find libmpi_gtl_cuda in ${MPICH_GTL_DIR}. "
-                    "If you hit a GTL runtime error, reconfigure with -DCMAKE_CXX_COMPILER=$(which CC).")
+                "Could not find libmpi_gtl_cuda in ${MPICH_GTL_DIR}. "
+                "If you hit a GTL runtime error, reconfigure with -DCMAKE_CXX_COMPILER=$(which CC).")
         endif ()
     endif ()
 
