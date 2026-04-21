@@ -1,4 +1,5 @@
 #include "DistributedDataLoader.hpp"
+#include "FFLayer.hpp"
 #include "MNIST.hpp"
 #include "Model.hpp"
 #include "SGDOptimizer.hpp"
@@ -88,50 +89,62 @@ void train(int rank, int world_size, const char *data_dir,
     DistributedDataLoader data_loader(train_data, rank, world_size, batch_size,
                                       42);
 
+    cudaEvent_t iter_start, compute_end, comm_end;
+    CUDACHECK(cudaEventCreate(&iter_start));
+    CUDACHECK(cudaEventCreate(&compute_end));
+    CUDACHECK(cudaEventCreate(&comm_end));
+
     for (int epoch = 0; epoch < num_epochs; ++epoch) {
-        std::printf("Epoch %d\n", epoch + 1);
+        if (rank == 0)
+            std::printf("Epoch %d\n", epoch + 1);
 
         data_loader.reset();
         model.reset_score();
 
         int batch_count = 0;
+        float epoch_compute_ms = 0.0f;
+        float epoch_comm_ms = 0.0f;
 
         while (data_loader.next_batch(host_images, host_labels)) {
             batch_x.copy_from_host(host_images);
             batch_y.copy_from_host(host_labels);
 
+            CUDACHECK(cudaEventRecord(iter_start, get_cuda_stream()));
+
             float loss = model.forward(batch_x, batch_y);
             model.backward();
 
-            // all reduce gradients across all ranks before optimizer step
-            NCCLCHECK(ncclAllReduce(model.layer1().weight_grads().data(),
-                                    model.layer1().weight_grads().data(),
-                                    model.layer1().weight_grads().size(),
-                                    ncclFloat, ncclSum, comm,
-                                    get_cuda_stream()));
-            NCCLCHECK(ncclAllReduce(model.layer1().bias_grads().data(),
-                                    model.layer1().bias_grads().data(),
-                                    model.layer1().bias_grads().size(),
-                                    ncclFloat, ncclSum, comm,
-                                    get_cuda_stream()));
-            NCCLCHECK(ncclAllReduce(model.layer2().weight_grads().data(),
-                                    model.layer2().weight_grads().data(),
-                                    model.layer2().weight_grads().size(),
-                                    ncclFloat, ncclSum, comm,
-                                    get_cuda_stream()));
-            NCCLCHECK(ncclAllReduce(model.layer2().bias_grads().data(),
-                                    model.layer2().bias_grads().data(),
-                                    model.layer2().bias_grads().size(),
-                                    ncclFloat, ncclSum, comm,
-                                    get_cuda_stream()));
+            CUDACHECK(cudaEventRecord(compute_end, get_cuda_stream()));
 
-            // Make sure all NCCL all-reduces finish first
+            // all reduce gradients across all ranks before optimizer step
+            for (FFLayer* layer : model.layers()) {
+                NCCLCHECK(ncclAllReduce(layer->weight_grads().data(),
+                                        layer->weight_grads().data(),
+                                        layer->weight_grads().size(),
+                                        ncclFloat, ncclSum, comm,
+                                        get_cuda_stream()));
+                NCCLCHECK(ncclAllReduce(layer->bias_grads().data(),
+                                        layer->bias_grads().data(),
+                                        layer->bias_grads().size(),
+                                        ncclFloat, ncclSum, comm,
+                                        get_cuda_stream()));
+            }
+
+            CUDACHECK(cudaEventRecord(comm_end, get_cuda_stream()));
+
+            // Sync stream — all three events are now complete after this
             CUDACHECK(cudaStreamSynchronize(get_cuda_stream()));
 
-            model.layer1().weight_grads().div(world_size);
-            model.layer1().bias_grads().div(world_size);
-            model.layer2().weight_grads().div(world_size);
-            model.layer2().bias_grads().div(world_size);
+            float compute_ms, comm_ms;
+            CUDACHECK(cudaEventElapsedTime(&compute_ms, iter_start, compute_end));
+            CUDACHECK(cudaEventElapsedTime(&comm_ms, compute_end, comm_end));
+            epoch_compute_ms += compute_ms;
+            epoch_comm_ms += comm_ms;
+
+            for (FFLayer* layer : model.layers()) {
+                layer->weight_grads().div(world_size);
+                layer->bias_grads().div(world_size);
+            }
 
             optimizer.step(model.layer2());
             optimizer.step(model.layer1());
@@ -145,10 +158,18 @@ void train(int rank, int world_size, const char *data_dir,
         }
 
         if (rank == 0) {
+            float total_ms = epoch_compute_ms + epoch_comm_ms;
+            float comm_pct = 100.0f * epoch_comm_ms / total_ms;
             std::printf("Epoch %d complete | avg loss = %.6f | acc = %.4f\n",
                         epoch + 1, model.avg_loss(), model.accuracy());
+            std::printf("  compute = %.1f ms | comm = %.1f ms | total = %.1f ms | comm %% = %.1f%%\n",
+                        epoch_compute_ms, epoch_comm_ms, total_ms, comm_pct);
         }
     }
+
+    CUDACHECK(cudaEventDestroy(iter_start));
+    CUDACHECK(cudaEventDestroy(compute_end));
+    CUDACHECK(cudaEventDestroy(comm_end));
 
     if (rank == 0) {
         model.save(output_path);

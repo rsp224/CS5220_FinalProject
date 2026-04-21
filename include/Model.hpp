@@ -5,6 +5,7 @@
 #include "Tensor.hpp"
 
 #include <string>
+#include <vector>
 
 class Model {
 public:
@@ -24,6 +25,7 @@ public:
 
     FFLayer& layer1() noexcept;
     FFLayer& layer2() noexcept;
+    std::vector<FFLayer*> layers() noexcept;
 
 private:
     int input_dim_;

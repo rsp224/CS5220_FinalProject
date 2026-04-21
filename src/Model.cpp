@@ -55,6 +55,10 @@ FFLayer& Model::layer2() noexcept {
     return layer2_;
 }
 
+std::vector<FFLayer*> Model::layers() noexcept {
+    return {&layer1_, &layer2_};
+}
+
 void Model::save(const std::string& filename) const {
     std::ofstream out(filename, std::ios::binary);
     if (!out) {
