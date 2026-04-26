@@ -29,10 +29,16 @@ float Model::forward(const Tensor& input, const Tensor& target) {
     return loss_.forward(logits_, target);
 }
 
-void Model::backward() {
+void Model::backward(const std::function<void(FFLayer&)>& after_layer_backward) {
     loss_.backward(grad_logits_);
     layer2_.backward(grad_logits_, grad_hidden_);
-    layer1_.backward(grad_hidden_, grad_input_); 
+    if (after_layer_backward) {
+        after_layer_backward(layer2_);
+    }
+    layer1_.backward(grad_hidden_, grad_input_);
+    if (after_layer_backward) {
+        after_layer_backward(layer1_);
+    }
 }
 
 float Model::avg_loss() const noexcept {

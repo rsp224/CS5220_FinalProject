@@ -4,6 +4,7 @@
 #include "FFLayer.hpp"
 #include "Tensor.hpp"
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -14,7 +15,7 @@ public:
     void init(unsigned int seed = 0);
 
     float forward(const Tensor& input, const Tensor& target);
-    void backward();
+    void backward(const std::function<void(FFLayer&)>& after_layer_backward = {});
 
     void save(const std::string& filename) const;
     void load(const std::string& filename);
