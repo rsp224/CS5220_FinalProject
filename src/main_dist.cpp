@@ -79,11 +79,11 @@ Model create_model(int rank, int local_batch_size, int hidden_dim, unsigned int 
 
 void train(int rank, int world_size, const char *data_dir,
            const char *output_path, ncclComm_t comm, int hidden_dim,
-           int bucket_size, const char *algo)
+           int bucket_size, int accum_steps, const char *algo)
 {
     std::printf("Executing training routine\n");
     if (rank == 0)
-        std::printf("NCCL algorithm: %s\n", algo);
+        std::printf("NCCL algorithm: %s | accum_steps: %d\n", algo, accum_steps);
 
     std::string base(data_dir);
 
@@ -100,8 +100,7 @@ void train(int rank, int world_size, const char *data_dir,
     Tensor batch_x(local_batch_size, input_dim);
     Tensor batch_y(local_batch_size, output_dim);
 
-    DistributedDataLoader data_loader(train_data, rank, world_size, batch_size,
-                                      42);
+    DistributedDataLoader data_loader(train_data, rank, world_size, batch_size, 42);
 
     // Collect gradient tensors in a stable order for bucketing
     std::vector<Tensor *> grad_tensors;
@@ -118,16 +117,20 @@ void train(int rank, int world_size, const char *data_dir,
     if (bucket_size <= 0)
         bucket_size = total_grad_elems;
 
+    // grad_buffer: flat scratch buffer for packing one backward pass.
+    // accum_buffer: running sum of grad_buffer across accum_steps iterations.
     Tensor grad_buffer(1, total_grad_elems);
+    Tensor accum_buffer(1, total_grad_elems);
 
     if (rank == 0)
         std::printf("Gradient bucketing: total=%d elems, bucket_size=%d (%d buckets)\n",
                     total_grad_elems, bucket_size,
                     (total_grad_elems + bucket_size - 1) / bucket_size);
 
-    cudaEvent_t iter_start, compute_end, comm_end;
+    cudaEvent_t iter_start, compute_end, comm_start, comm_end;
     CUDACHECK(cudaEventCreate(&iter_start));
     CUDACHECK(cudaEventCreate(&compute_end));
+    CUDACHECK(cudaEventCreate(&comm_start));
     CUDACHECK(cudaEventCreate(&comm_end));
 
     for (int epoch = 0; epoch < num_epochs; ++epoch)
@@ -138,7 +141,12 @@ void train(int rank, int world_size, const char *data_dir,
         data_loader.reset();
         model.reset_score();
 
+        // Zero accum_buffer at the start of each epoch.
+        CUDACHECK(cudaMemsetAsync(accum_buffer.data(), 0, accum_buffer.bytes(),
+                                  get_cuda_stream()));
+
         int batch_count = 0;
+        int accum_count = 0;
         float epoch_compute_ms = 0.0f;
         float epoch_comm_ms = 0.0f;
 
@@ -154,7 +162,9 @@ void train(int rank, int world_size, const char *data_dir,
 
             CUDACHECK(cudaEventRecord(compute_end, get_cuda_stream()));
 
-            // Pack all gradient tensors into the flat buffer
+            // Pack gradients into flat buffer, then add into accum_buffer.
+            // backward() overwrites grad tensors each call (beta=0), so we
+            // must accumulate into a separate buffer across steps.
             int offset = 0;
             for (Tensor *t : grad_tensors)
             {
@@ -164,56 +174,68 @@ void train(int rank, int world_size, const char *data_dir,
                                           get_cuda_stream()));
                 offset += static_cast<int>(t->size());
             }
+            accum_buffer.accumulate(grad_buffer, get_cuda_stream());
+            ++accum_count;
 
-            // AllReduce the flat buffer in bucket_size chunks
-            offset = 0;
-            while (offset < total_grad_elems)
+            if (accum_count == accum_steps)
             {
-                int count = std::min(bucket_size, total_grad_elems - offset);
-                NCCLCHECK(ncclAllReduce(grad_buffer.data() + offset,
-                                        grad_buffer.data() + offset,
-                                        count, ncclFloat, ncclSum, comm,
-                                        get_cuda_stream()));
-                offset += count;
+                // AllReduce the accumulated gradients in bucket_size chunks.
+                CUDACHECK(cudaEventRecord(comm_start, get_cuda_stream()));
+                offset = 0;
+                while (offset < total_grad_elems)
+                {
+                    int count = std::min(bucket_size, total_grad_elems - offset);
+                    NCCLCHECK(ncclAllReduce(accum_buffer.data() + offset,
+                                            accum_buffer.data() + offset,
+                                            count, ncclFloat, ncclSum, comm,
+                                            get_cuda_stream()));
+                    offset += count;
+                }
+                CUDACHECK(cudaEventRecord(comm_end, get_cuda_stream()));
+
+                // Unpack reduced gradients back into each tensor.
+                offset = 0;
+                for (Tensor *t : grad_tensors)
+                {
+                    CUDACHECK(cudaMemcpyAsync(t->data(), accum_buffer.data() + offset,
+                                              t->size() * sizeof(float),
+                                              cudaMemcpyDeviceToDevice,
+                                              get_cuda_stream()));
+                    offset += static_cast<int>(t->size());
+                }
+
+                CUDACHECK(cudaStreamSynchronize(get_cuda_stream()));
+
+                float compute_ms, comm_ms;
+                CUDACHECK(cudaEventElapsedTime(&compute_ms, iter_start, compute_end));
+                CUDACHECK(cudaEventElapsedTime(&comm_ms, comm_start, comm_end));
+                epoch_compute_ms += compute_ms;
+                epoch_comm_ms += comm_ms;
+
+                // Divide by world_size * accum_steps to get the true average
+                // gradient over all ranks and accumulated mini-batches.
+                const float scale = static_cast<float>(world_size * accum_steps);
+                for (FFLayer *layer : model.layers())
+                {
+                    layer->weight_grads().div(scale);
+                    layer->bias_grads().div(scale);
+                }
+
+                optimizer.step(model.layer2());
+                optimizer.step(model.layer1());
+
+                // Reset accumulation buffer and counter.
+                CUDACHECK(cudaMemsetAsync(accum_buffer.data(), 0,
+                                          accum_buffer.bytes(), get_cuda_stream()));
+                accum_count = 0;
             }
-
-            CUDACHECK(cudaEventRecord(comm_end, get_cuda_stream()));
-
-            // Unpack reduced gradients back into each tensor
-            offset = 0;
-            for (Tensor *t : grad_tensors)
-            {
-                CUDACHECK(cudaMemcpyAsync(t->data(), grad_buffer.data() + offset,
-                                          t->size() * sizeof(float),
-                                          cudaMemcpyDeviceToDevice,
-                                          get_cuda_stream()));
-                offset += static_cast<int>(t->size());
-            }
-
-            // Sync stream — all events and memcpys complete after this
-            CUDACHECK(cudaStreamSynchronize(get_cuda_stream()));
-
-            float compute_ms, comm_ms;
-            CUDACHECK(cudaEventElapsedTime(&compute_ms, iter_start, compute_end));
-            CUDACHECK(cudaEventElapsedTime(&comm_ms, compute_end, comm_end));
-            epoch_compute_ms += compute_ms;
-            epoch_comm_ms += comm_ms;
-
-            for (FFLayer *layer : model.layers())
-            {
-                layer->weight_grads().div(world_size);
-                layer->bias_grads().div(world_size);
-            }
-
-            optimizer.step(model.layer2());
-            optimizer.step(model.layer1());
 
             ++batch_count;
 
             if (rank == 0 && batch_count % 100 == 0)
             {
-                std::printf("  Batch %d | loss = %.6f | acc = %.4f\n",
-                            batch_count, loss, model.accuracy());
+                std::printf("  Batch %d | acc_step %d/%d | loss = %.6f | acc = %.4f\n",
+                            batch_count, accum_count, accum_steps, loss, model.accuracy());
             }
         }
 
@@ -230,6 +252,7 @@ void train(int rank, int world_size, const char *data_dir,
 
     CUDACHECK(cudaEventDestroy(iter_start));
     CUDACHECK(cudaEventDestroy(compute_end));
+    CUDACHECK(cudaEventDestroy(comm_start));
     CUDACHECK(cudaEventDestroy(comm_end));
 
     if (rank == 0)
@@ -253,11 +276,15 @@ int main(int argc, char **argv)
     MPICHECK(MPI_Bcast(&id, sizeof(id), MPI_BYTE, 0, MPI_COMM_WORLD));
 
     // argv[1]: hidden_dim  (default 32)
-    // argv[2]: bucket_size (default -1 = one bucket, computed from model size)
-    // argv[3]: algo        ("ring", "tree", or omit to let NCCL decide)
+    // argv[2]: bucket_size (default -1 = one bucket)
+    // argv[3]: accum_steps (default 1 = no accumulation)
+    // argv[4]: algo        ("ring", "tree", or omit to let NCCL decide)
     int hidden_dim  = (argc >= 2) ? std::atoi(argv[1]) : 32;
     int bucket_size = (argc >= 3) ? std::atoi(argv[2]) : -1;
-    const char *algo_arg = (argc >= 4) ? argv[3] : "auto";
+    int accum_steps = (argc >= 4) ? std::atoi(argv[3]) : 1;
+    const char *algo_arg = (argc >= 5) ? argv[4] : "auto";
+
+    if (accum_steps < 1) accum_steps = 1;
 
     // Must be set before ncclCommInitRank so NCCL picks up the algorithm.
     if (std::strcmp(algo_arg, "ring") == 0)
@@ -284,7 +311,7 @@ int main(int argc, char **argv)
     const char data_dir[] = "data";
     const char output_path[] = "ff.params";
 
-    train(rank, size, data_dir, output_path, comm, hidden_dim, bucket_size, algo_arg);
+    train(rank, size, data_dir, output_path, comm, hidden_dim, bucket_size, accum_steps, algo_arg);
 
     ncclCommDestroy(comm);
     // Stream is owned by the get_cuda_stream() static and is released at exit.
