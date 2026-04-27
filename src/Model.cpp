@@ -18,62 +18,79 @@ Model::Model(int input_dim, int hidden_dim, int output_dim, int batch_size)
       grad_logits_(batch_size, output_dim),
       grad_hidden_(batch_size, hidden_dim) {}
 
-void Model::init(unsigned int seed) {
+void Model::init(unsigned int seed)
+{
     layer1_.init(seed + 1);
     layer2_.init(seed + 2);
 }
 
-float Model::forward(const Tensor& input, const Tensor& target) {
+float Model::forward(const Tensor &input, const Tensor &target)
+{
     layer1_.forward(input, hidden_);
     layer2_.forward(hidden_, logits_);
     return loss_.forward(logits_, target);
 }
 
-void Model::backward(const std::function<void(FFLayer&)>& after_layer_backward) {
+void Model::backward()
+{
     loss_.backward(grad_logits_);
     layer2_.backward(grad_logits_, grad_hidden_);
-    if (after_layer_backward) {
-        after_layer_backward(layer2_);
-    }
     layer1_.backward(grad_hidden_, grad_input_);
-    if (after_layer_backward) {
-        after_layer_backward(layer1_);
-    }
 }
 
-float Model::avg_loss() const noexcept {
+void Model::backward_upper()
+{
+    loss_.backward(grad_logits_);
+    layer2_.backward(grad_logits_, grad_hidden_);
+}
+
+void Model::backward_lower()
+{
+    layer1_.backward(grad_hidden_, grad_input_);
+}
+
+float Model::avg_loss() const noexcept
+{
     return loss_.avg_loss();
 }
 
-float Model::accuracy() const noexcept {
+float Model::accuracy() const noexcept
+{
     return loss_.accuracy();
 }
 
-void Model::reset_score() {
+void Model::reset_score()
+{
     loss_.reset_score();
 }
 
-FFLayer& Model::layer1() noexcept {
+FFLayer &Model::layer1() noexcept
+{
     return layer1_;
 }
 
-FFLayer& Model::layer2() noexcept {
+FFLayer &Model::layer2() noexcept
+{
     return layer2_;
 }
 
-std::vector<FFLayer*> Model::layers() noexcept {
+std::vector<FFLayer *> Model::layers() noexcept
+{
     return {&layer1_, &layer2_};
 }
 
-void Model::save(const std::string& filename) const {
+void Model::save(const std::string &filename) const
+{
     std::ofstream out(filename, std::ios::binary);
-    if (!out) {
+    if (!out)
+    {
         throw std::runtime_error("Failed to open file for saving: " + filename);
     }
 
-    auto write_tensor = [&out](const Tensor& t) {
+    auto write_tensor = [&out](const Tensor &t)
+    {
         std::vector<float> host = t.copy_to_host();
-        out.write(reinterpret_cast<const char*>(host.data()),
+        out.write(reinterpret_cast<const char *>(host.data()),
                   static_cast<std::streamsize>(host.size() * sizeof(float)));
     };
 
@@ -83,17 +100,21 @@ void Model::save(const std::string& filename) const {
     write_tensor(layer2_.biases());
 }
 
-void Model::load(const std::string& filename) {
+void Model::load(const std::string &filename)
+{
     std::ifstream in(filename, std::ios::binary);
-    if (!in) {
+    if (!in)
+    {
         throw std::runtime_error("Failed to open file for loading: " + filename);
     }
 
-    auto read_tensor = [&in](Tensor& t) {
+    auto read_tensor = [&in](Tensor &t)
+    {
         std::vector<float> host(t.size());
-        in.read(reinterpret_cast<char*>(host.data()),
+        in.read(reinterpret_cast<char *>(host.data()),
                 static_cast<std::streamsize>(host.size() * sizeof(float)));
-        if (!in) {
+        if (!in)
+        {
             throw std::runtime_error("Failed while reading model file.");
         }
         t.copy_from_host(host);

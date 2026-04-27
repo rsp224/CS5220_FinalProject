@@ -4,7 +4,6 @@
 #include "FFLayer.hpp"
 #include "Tensor.hpp"
 
-#include <functional>
 #include <string>
 #include <vector>
 
@@ -15,7 +14,9 @@ public:
     void init(unsigned int seed = 0);
 
     float forward(const Tensor& input, const Tensor& target);
-    void backward(const std::function<void(FFLayer&)>& after_layer_backward = {});
+    void backward();
+    void backward_upper();  // loss + layer2; produces layer2 grads and grad_hidden_
+    void backward_lower();  // layer1; must follow backward_upper()
 
     void save(const std::string& filename) const;
     void load(const std::string& filename);
