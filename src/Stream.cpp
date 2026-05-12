@@ -37,3 +37,4 @@ cudaStream_t get_comm_stream()
     }
     return stream;
 }
+

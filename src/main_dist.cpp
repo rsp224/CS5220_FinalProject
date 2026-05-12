@@ -1,3 +1,4 @@
+#include "CIFAR10.hpp"
 #include "DistributedDataLoader.hpp"
 #include "FFLayer.hpp"
 #include "MNIST.hpp"
@@ -47,53 +48,47 @@
         }                                                                 \
     } while (0)
 
-static constexpr int batch_size = 80;
-static constexpr int input_dim = 784;
-static constexpr int output_dim = 10;
-static constexpr int num_epochs = 5;
+static constexpr int batch_size = 1600;
+static constexpr int num_epochs = 10;
 
-Model create_model(int rank, int local_batch_size, int hidden_dim, unsigned int seed = 0)
+Model create_model(int rank, int local_batch_size, int input_dim, int output_dim,
+                   int hidden_dim, unsigned int seed = 0)
 {
     Model model(input_dim, hidden_dim, output_dim, local_batch_size);
-    // only initialize on rank 0 and broadcast model params to others
     if (rank == 0)
-    {
         model.init(seed);
-    }
 
     MPICHECK(MPI_Bcast(model.layer1().weights().data(),
-                       model.layer1().weights().size(), MPI_FLOAT, 0,
-                       MPI_COMM_WORLD));
+                       model.layer1().weights().size(), MPI_FLOAT, 0, MPI_COMM_WORLD));
     MPICHECK(MPI_Bcast(model.layer1().biases().data(),
-                       model.layer1().biases().size(), MPI_FLOAT, 0,
-                       MPI_COMM_WORLD));
+                       model.layer1().biases().size(), MPI_FLOAT, 0, MPI_COMM_WORLD));
     MPICHECK(MPI_Bcast(model.layer2().weights().data(),
-                       model.layer2().weights().size(), MPI_FLOAT, 0,
-                       MPI_COMM_WORLD));
+                       model.layer2().weights().size(), MPI_FLOAT, 0, MPI_COMM_WORLD));
     MPICHECK(MPI_Bcast(model.layer2().biases().data(),
-                       model.layer2().biases().size(), MPI_FLOAT, 0,
-                       MPI_COMM_WORLD));
+                       model.layer2().biases().size(), MPI_FLOAT, 0, MPI_COMM_WORLD));
+    MPICHECK(MPI_Bcast(model.layer3().weights().data(),
+                       model.layer3().weights().size(), MPI_FLOAT, 0, MPI_COMM_WORLD));
+    MPICHECK(MPI_Bcast(model.layer3().biases().data(),
+                       model.layer3().biases().size(), MPI_FLOAT, 0, MPI_COMM_WORLD));
 
     return model;
 }
 
-void train(int rank, int world_size, const char *data_dir,
-           const char *output_path, ncclComm_t comm, int hidden_dim,
-           int bucket_size, int accum_steps, const char *algo)
+template<typename Dataset>
+void train(int rank, int world_size, Dataset& train_data,
+           const char *output_path, ncclComm_t comm, int input_dim, int output_dim,
+           int hidden_dim, int bucket_size, int accum_steps, const char *algo,
+           float learning_rate)
 {
     std::printf("Executing training routine\n");
     if (rank == 0)
-        std::printf("NCCL algorithm: %s | accum_steps: %d\n", algo, accum_steps);
+        std::printf("NCCL algorithm: %s | accum_steps: %d | input_dim: %d | hidden_dim: %d | lr: %.4f\n",
+                    algo, accum_steps, input_dim, hidden_dim, learning_rate);
 
-    std::string base(data_dir);
-
-    MNIST train_data(base + "/train-images-idx3-ubyte",
-                     base + "/train-labels-idx1-ubyte");
-
-    SGDOptimizer optimizer(0.3f);
+    SGDOptimizer optimizer(learning_rate);
 
     const int local_batch_size = batch_size / world_size;
-    Model model = create_model(rank, local_batch_size, hidden_dim, 42);
+    Model model = create_model(rank, local_batch_size, input_dim, output_dim, hidden_dim, 42);
 
     std::vector<float> host_images, host_labels;
 
@@ -102,11 +97,15 @@ void train(int rank, int world_size, const char *data_dir,
 
     DistributedDataLoader data_loader(train_data, rank, world_size, batch_size, 42);
 
-    // Separate grad groups so we can AllReduce layer2 (upper) while layer1
-    // (lower) backward is still running on the compute stream.
-    std::vector<Tensor *> upper_grads = {&model.layer2().weight_grads(),
-                                         &model.layer2().bias_grads()};
-    std::vector<Tensor *> lower_grads = {&model.layer1().weight_grads(),
+    // upper: layer3 grads (ready after backward_upper).
+    // lower: layer2 + layer1 grads (ready after backward_lower).
+    // On the final accumulation step, upper AllReduce runs on comm stream
+    // concurrently with lower backward on compute stream.
+    std::vector<Tensor *> upper_grads = {&model.layer3().weight_grads(),
+                                         &model.layer3().bias_grads()};
+    std::vector<Tensor *> lower_grads = {&model.layer2().weight_grads(),
+                                         &model.layer2().bias_grads(),
+                                         &model.layer1().weight_grads(),
                                          &model.layer1().bias_grads()};
 
     int upper_elems = 0, lower_elems = 0;
@@ -116,27 +115,25 @@ void train(int rank, int world_size, const char *data_dir,
     if (bucket_size <= 0)
         bucket_size = upper_elems + lower_elems;
 
-    // One scratch buffer and one accumulation buffer per layer group.
     Tensor grad_buf_upper(1, upper_elems), accum_buf_upper(1, upper_elems);
     Tensor grad_buf_lower(1, lower_elems), accum_buf_lower(1, lower_elems);
 
     if (rank == 0)
-        std::printf("Grad elems: upper(layer2)=%d lower(layer1)=%d bucket_size=%d\n",
+        std::printf("Grad elems: upper(layer3)=%d lower(layer2+1)=%d bucket_size=%d\n",
                     upper_elems, lower_elems, bucket_size);
 
-    (void)get_comm_stream();  // warm up before training loop
+    (void)get_comm_stream();
 
-    // iter_start/compute_end on compute stream for compute timing.
-    // layer2_ready: signals comm stream that upper grads are in accum_buf_upper.
+    // iter_start/compute_end on compute stream for timing.
+    // layer3_ready: inter-stream signal after upper grads are accumulated.
     // comm_start/comm_end on comm stream for AllReduce timing.
-    cudaEvent_t iter_start, layer2_ready, compute_end, comm_start, comm_end;
+    cudaEvent_t iter_start, layer3_ready, compute_end, comm_start, comm_end;
     CUDACHECK(cudaEventCreate(&iter_start));
-    CUDACHECK(cudaEventCreate(&layer2_ready));
+    CUDACHECK(cudaEventCreate(&layer3_ready));
     CUDACHECK(cudaEventCreate(&compute_end));
     CUDACHECK(cudaEventCreate(&comm_start));
     CUDACHECK(cudaEventCreate(&comm_end));
 
-    // Lambda: pack a list of grad tensors into a flat buffer starting at offset 0.
     auto pack = [&](Tensor &dst, std::vector<Tensor *> &srcs)
     {
         int off = 0;
@@ -149,7 +146,6 @@ void train(int rank, int world_size, const char *data_dir,
         }
     };
 
-    // Lambda: unpack a flat buffer back into a list of grad tensors.
     auto unpack = [&](std::vector<Tensor *> &dsts, Tensor &src)
     {
         int off = 0;
@@ -162,7 +158,7 @@ void train(int rank, int world_size, const char *data_dir,
         }
     };
 
-    // Lambda: AllReduce a flat buffer in bucket_size chunks on the comm stream.
+    // AllReduce a flat buffer in bucket_size chunks on the comm stream.
     auto allreduce = [&](Tensor &buf, int elems)
     {
         int off = 0;
@@ -208,25 +204,25 @@ void train(int rank, int world_size, const char *data_dir,
             {
                 // ---- Final step: overlap AllReduce with backward ----
 
-                // Layer2 backward → pack → accumulate into upper buffer.
+                // Layer3 backward → pack → accumulate upper.
                 model.backward_upper();
                 pack(grad_buf_upper, upper_grads);
                 accum_buf_upper.accumulate(grad_buf_upper, get_cuda_stream());
-                CUDACHECK(cudaEventRecord(layer2_ready, get_cuda_stream()));
+                CUDACHECK(cudaEventRecord(layer3_ready, get_cuda_stream()));
 
-                // Comm stream: wait for upper grads, AllReduce them.
-                // Runs concurrently with layer1 backward on compute stream.
-                CUDACHECK(cudaStreamWaitEvent(get_comm_stream(), layer2_ready, 0));
+                // Comm stream: wait for upper grads, AllReduce in buckets.
+                // Runs concurrently with layer2+1 backward on compute stream.
+                CUDACHECK(cudaStreamWaitEvent(get_comm_stream(), layer3_ready, 0));
                 CUDACHECK(cudaEventRecord(comm_start, get_comm_stream()));
                 allreduce(accum_buf_upper, upper_elems);
 
-                // Layer1 backward on compute stream (overlaps upper AllReduce).
+                // Layer2+1 backward on compute stream (overlaps upper AllReduce).
                 model.backward_lower();
                 pack(grad_buf_lower, lower_grads);
                 accum_buf_lower.accumulate(grad_buf_lower, get_cuda_stream());
                 CUDACHECK(cudaEventRecord(compute_end, get_cuda_stream()));
 
-                // Comm stream: wait for lower grads, AllReduce them.
+                // Comm stream: wait for lower grads, AllReduce in buckets.
                 CUDACHECK(cudaStreamWaitEvent(get_comm_stream(), compute_end, 0));
                 allreduce(accum_buf_lower, lower_elems);
                 CUDACHECK(cudaEventRecord(comm_end, get_comm_stream()));
@@ -236,8 +232,8 @@ void train(int rank, int world_size, const char *data_dir,
                 unpack(upper_grads, accum_buf_upper);
                 unpack(lower_grads, accum_buf_lower);
 
-                // Sync compute stream — comm_end has already fired since compute
-                // stream waited for it, so one sync covers both streams.
+                // Syncing compute stream is sufficient — comm_end has already
+                // fired since compute stream waited for it.
                 CUDACHECK(cudaStreamSynchronize(get_cuda_stream()));
 
                 float compute_ms, comm_ms;
@@ -253,6 +249,7 @@ void train(int rank, int world_size, const char *data_dir,
                     layer->bias_grads().div(scale);
                 }
 
+                optimizer.step(model.layer3());
                 optimizer.step(model.layer2());
                 optimizer.step(model.layer1());
 
@@ -284,8 +281,7 @@ void train(int rank, int world_size, const char *data_dir,
 
         if (rank == 0)
         {
-            // compute_ms and comm_ms overlap on the final step of each window,
-            // so their sum overstates wall time by the amount of overlap gained.
+            // compute_ms and comm_ms overlap, so their sum overstates wall time.
             std::printf("Epoch %d complete | avg loss = %.6f | acc = %.4f\n",
                         epoch + 1, model.avg_loss(), model.accuracy());
             std::printf("  compute = %.1f ms | comm = %.1f ms (overlap) | comm %% = %.1f%%\n",
@@ -295,7 +291,7 @@ void train(int rank, int world_size, const char *data_dir,
     }
 
     CUDACHECK(cudaEventDestroy(iter_start));
-    CUDACHECK(cudaEventDestroy(layer2_ready));
+    CUDACHECK(cudaEventDestroy(layer3_ready));
     CUDACHECK(cudaEventDestroy(compute_end));
     CUDACHECK(cudaEventDestroy(comm_start));
     CUDACHECK(cudaEventDestroy(comm_end));
@@ -320,14 +316,21 @@ int main(int argc, char **argv)
         NCCLCHECK(ncclGetUniqueId(&id));
     MPICHECK(MPI_Bcast(&id, sizeof(id), MPI_BYTE, 0, MPI_COMM_WORLD));
 
-    // argv[1]: hidden_dim  (default 32)
-    // argv[2]: bucket_size (default -1 = one bucket)
-    // argv[3]: accum_steps (default 1 = no accumulation)
-    // argv[4]: algo        ("ring", "tree", or omit to let NCCL decide)
-    int hidden_dim = (argc >= 2) ? std::atoi(argv[1]) : 32;
-    int bucket_size = (argc >= 3) ? std::atoi(argv[2]) : -1;
-    int accum_steps = (argc >= 4) ? std::atoi(argv[3]) : 1;
-    const char *algo_arg = (argc >= 5) ? argv[4] : "auto";
+    // argv[1]: dataset     ("mnist" default | "cifar10")
+    // argv[2]: hidden_dim  (default 1024 for mnist, 4096 for cifar10)
+    // argv[3]: bucket_size (default -1 = one bucket)
+    // argv[4]: accum_steps (default 1 = no accumulation)
+    // argv[5]: algo        ("ring", "tree", or omit to let NCCL decide)
+    // argv[6]: learning_rate (default 0.3 for mnist, 0.01 for cifar10)
+    const char *dataset_arg = (argc >= 2) ? argv[1] : "mnist";
+    bool use_cifar10 = (std::strcmp(dataset_arg, "cifar10") == 0);
+    int default_hidden = use_cifar10 ? 4096 : 1024;
+    int hidden_dim  = (argc >= 3) ? std::atoi(argv[2]) : default_hidden;
+    int bucket_size = (argc >= 4) ? std::atoi(argv[3]) : -1;
+    int accum_steps = (argc >= 5) ? std::atoi(argv[4]) : 1;
+    const char *algo_arg = (argc >= 6) ? argv[5] : "auto";
+    float default_lr = use_cifar10 ? 0.01f : 0.3f;
+    float learning_rate = (argc >= 7) ? std::atof(argv[6]) : default_lr;
 
     if (accum_steps < 1)
         accum_steps = 1;
@@ -337,18 +340,13 @@ int main(int argc, char **argv)
         setenv("NCCL_ALGO", "Ring", 1);
     else if (std::strcmp(algo_arg, "tree") == 0)
         setenv("NCCL_ALGO", "Tree", 1);
-    // "auto" or anything else: leave NCCL_ALGO unset so NCCL decides.
 
-    // Slurm should already handle GPU assignment where it assigns one GPU per
-    // rank
     int local_rank = 0;
     const char *local_rank_env = std::getenv("SLURM_LOCALID");
     if (local_rank_env != nullptr)
-    {
         local_rank = std::atoi(local_rank_env);
-    }
+
     CUDACHECK(cudaSetDevice(local_rank));
-    // Warm up the lazy stream singleton so NCCL and kernels share it.
     (void)get_cuda_stream();
 
     ncclComm_t comm;
@@ -357,10 +355,20 @@ int main(int argc, char **argv)
     const char data_dir[] = "data";
     const char output_path[] = "ff.params";
 
-    train(rank, size, data_dir, output_path, comm, hidden_dim, bucket_size, accum_steps, algo_arg);
+    if (use_cifar10) {
+        CIFAR10 train_data(std::string(data_dir) + "/cifar-10-batches-bin", true);
+        train(rank, size, train_data, output_path, comm,
+              CIFAR10::IMAGE_DIM, CIFAR10::NUM_CLASSES,
+              hidden_dim, bucket_size, accum_steps, algo_arg, learning_rate);
+    } else {
+        MNIST train_data(std::string(data_dir) + "/train-images-idx3-ubyte",
+                         std::string(data_dir) + "/train-labels-idx1-ubyte");
+        train(rank, size, train_data, output_path, comm,
+              MNIST::IMAGE_DIM, MNIST::NUM_CLASSES,
+              hidden_dim, bucket_size, accum_steps, algo_arg, learning_rate);
+    }
 
     ncclCommDestroy(comm);
-    // Stream is owned by the get_cuda_stream() static and is released at exit.
     MPICHECK(MPI_Finalize());
     return 0;
 }

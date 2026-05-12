@@ -27,6 +27,7 @@ if (NOT "${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU")
 endif ()
 
 set(COMMON_SOURCES
+    src/CIFAR10.cpp
     src/MNIST.cpp
     src/Model.cpp
     src/Stream.cpp
