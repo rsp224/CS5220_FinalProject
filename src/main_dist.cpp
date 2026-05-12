@@ -97,78 +97,52 @@ void train(int rank, int world_size, Dataset& train_data,
 
     DistributedDataLoader data_loader(train_data, rank, world_size, batch_size, 42);
 
-    // upper: layer3 grads (ready after backward_upper).
-    // lower: layer2 + layer1 grads (ready after backward_lower).
-    // On the final accumulation step, upper AllReduce runs on comm stream
-    // concurrently with lower backward on compute stream.
-    std::vector<Tensor *> upper_grads = {&model.layer3().weight_grads(),
-                                         &model.layer3().bias_grads()};
-    std::vector<Tensor *> lower_grads = {&model.layer2().weight_grads(),
-                                         &model.layer2().bias_grads(),
-                                         &model.layer1().weight_grads(),
-                                         &model.layer1().bias_grads()};
+    std::vector<Tensor *> all_grads = {
+        &model.layer3().weight_grads(), &model.layer3().bias_grads(),
+        &model.layer2().weight_grads(), &model.layer2().bias_grads(),
+        &model.layer1().weight_grads(), &model.layer1().bias_grads()
+    };
 
-    int upper_elems = 0, lower_elems = 0;
-    for (Tensor *t : upper_grads) upper_elems += static_cast<int>(t->size());
-    for (Tensor *t : lower_grads) lower_elems += static_cast<int>(t->size());
+    int total_elems = 0;
+    for (Tensor *t : all_grads) total_elems += static_cast<int>(t->size());
 
     if (bucket_size <= 0)
-        bucket_size = upper_elems + lower_elems;
+        bucket_size = total_elems;
 
-    Tensor grad_buf_upper(1, upper_elems), accum_buf_upper(1, upper_elems);
-    Tensor grad_buf_lower(1, lower_elems), accum_buf_lower(1, lower_elems);
+    Tensor grad_buf(1, total_elems), accum_buf(1, total_elems);
 
     if (rank == 0)
-        std::printf("Grad elems: upper(layer3)=%d lower(layer2+1)=%d bucket_size=%d\n",
-                    upper_elems, lower_elems, bucket_size);
+        std::printf("Total grad elems: %d | bucket_size: %d (%d buckets)\n",
+                    total_elems, bucket_size,
+                    (total_elems + bucket_size - 1) / bucket_size);
 
-    (void)get_comm_stream();
-
-    // iter_start/compute_end on compute stream for timing.
-    // layer3_ready: inter-stream signal after upper grads are accumulated.
-    // comm_start/comm_end on comm stream for AllReduce timing.
-    cudaEvent_t iter_start, layer3_ready, compute_end, comm_start, comm_end;
+    cudaEvent_t iter_start, compute_end, comm_start, comm_end;
     CUDACHECK(cudaEventCreate(&iter_start));
-    CUDACHECK(cudaEventCreate(&layer3_ready));
     CUDACHECK(cudaEventCreate(&compute_end));
     CUDACHECK(cudaEventCreate(&comm_start));
     CUDACHECK(cudaEventCreate(&comm_end));
 
-    auto pack = [&](Tensor &dst, std::vector<Tensor *> &srcs)
+    auto pack = [&]()
     {
         int off = 0;
-        for (Tensor *t : srcs)
+        for (Tensor *t : all_grads)
         {
-            CUDACHECK(cudaMemcpyAsync(dst.data() + off, t->data(),
+            CUDACHECK(cudaMemcpyAsync(grad_buf.data() + off, t->data(),
                                       t->size() * sizeof(float),
                                       cudaMemcpyDeviceToDevice, get_cuda_stream()));
             off += static_cast<int>(t->size());
         }
     };
 
-    auto unpack = [&](std::vector<Tensor *> &dsts, Tensor &src)
+    auto unpack = [&]()
     {
         int off = 0;
-        for (Tensor *t : dsts)
+        for (Tensor *t : all_grads)
         {
-            CUDACHECK(cudaMemcpyAsync(t->data(), src.data() + off,
+            CUDACHECK(cudaMemcpyAsync(t->data(), accum_buf.data() + off,
                                       t->size() * sizeof(float),
                                       cudaMemcpyDeviceToDevice, get_cuda_stream()));
             off += static_cast<int>(t->size());
-        }
-    };
-
-    // AllReduce a flat buffer in bucket_size chunks on the comm stream.
-    auto allreduce = [&](Tensor &buf, int elems)
-    {
-        int off = 0;
-        while (off < elems)
-        {
-            int count = std::min(bucket_size, elems - off);
-            NCCLCHECK(ncclAllReduce(buf.data() + off, buf.data() + off,
-                                    count, ncclFloat, ncclSum, comm,
-                                    get_comm_stream()));
-            off += count;
         }
     };
 
@@ -180,10 +154,8 @@ void train(int rank, int world_size, Dataset& train_data,
         data_loader.reset();
         model.reset_score();
 
-        CUDACHECK(cudaMemsetAsync(accum_buf_upper.data(), 0,
-                                  accum_buf_upper.bytes(), get_cuda_stream()));
-        CUDACHECK(cudaMemsetAsync(accum_buf_lower.data(), 0,
-                                  accum_buf_lower.bytes(), get_cuda_stream()));
+        CUDACHECK(cudaMemsetAsync(accum_buf.data(), 0,
+                                  accum_buf.bytes(), get_cuda_stream()));
 
         int batch_count = 0;
         int accum_count = 0;
@@ -196,44 +168,34 @@ void train(int rank, int world_size, Dataset& train_data,
             batch_y.copy_from_host(host_labels);
 
             CUDACHECK(cudaEventRecord(iter_start, get_cuda_stream()));
+
             float loss = model.forward(batch_x, batch_y);
+            model.backward();
+            pack();
+            accum_buf.accumulate(grad_buf, get_cuda_stream());
 
-            const bool is_final = (accum_count == accum_steps - 1);
+            CUDACHECK(cudaEventRecord(compute_end, get_cuda_stream()));
 
-            if (is_final)
+            ++accum_count;
+
+            if (accum_count == accum_steps)
             {
-                // ---- Final step: overlap AllReduce with backward ----
+                CUDACHECK(cudaStreamSynchronize(get_cuda_stream()));
 
-                // Layer3 backward → pack → accumulate upper.
-                model.backward_upper();
-                pack(grad_buf_upper, upper_grads);
-                accum_buf_upper.accumulate(grad_buf_upper, get_cuda_stream());
-                CUDACHECK(cudaEventRecord(layer3_ready, get_cuda_stream()));
+                CUDACHECK(cudaEventRecord(comm_start, get_cuda_stream()));
 
-                // Comm stream: wait for upper grads, AllReduce in buckets.
-                // Runs concurrently with layer2+1 backward on compute stream.
-                CUDACHECK(cudaStreamWaitEvent(get_comm_stream(), layer3_ready, 0));
-                CUDACHECK(cudaEventRecord(comm_start, get_comm_stream()));
-                allreduce(accum_buf_upper, upper_elems);
+                int off = 0;
+                while (off < total_elems)
+                {
+                    int count = std::min(bucket_size, total_elems - off);
+                    NCCLCHECK(ncclAllReduce(accum_buf.data() + off,
+                                            accum_buf.data() + off,
+                                            count, ncclFloat, ncclSum, comm,
+                                            get_cuda_stream()));
+                    off += count;
+                }
 
-                // Layer2+1 backward on compute stream (overlaps upper AllReduce).
-                model.backward_lower();
-                pack(grad_buf_lower, lower_grads);
-                accum_buf_lower.accumulate(grad_buf_lower, get_cuda_stream());
-                CUDACHECK(cudaEventRecord(compute_end, get_cuda_stream()));
-
-                // Comm stream: wait for lower grads, AllReduce in buckets.
-                CUDACHECK(cudaStreamWaitEvent(get_comm_stream(), compute_end, 0));
-                allreduce(accum_buf_lower, lower_elems);
-                CUDACHECK(cudaEventRecord(comm_end, get_comm_stream()));
-
-                // Compute stream waits for all AllReduces before unpack/optimizer.
-                CUDACHECK(cudaStreamWaitEvent(get_cuda_stream(), comm_end, 0));
-                unpack(upper_grads, accum_buf_upper);
-                unpack(lower_grads, accum_buf_lower);
-
-                // Syncing compute stream is sufficient — comm_end has already
-                // fired since compute stream waited for it.
+                CUDACHECK(cudaEventRecord(comm_end, get_cuda_stream()));
                 CUDACHECK(cudaStreamSynchronize(get_cuda_stream()));
 
                 float compute_ms, comm_ms;
@@ -243,6 +205,9 @@ void train(int rank, int world_size, Dataset& train_data,
                 epoch_comm_ms += comm_ms;
 
                 const float scale = static_cast<float>(world_size * accum_steps);
+                unpack();
+                CUDACHECK(cudaStreamSynchronize(get_cuda_stream()));
+
                 for (FFLayer *layer : model.layers())
                 {
                     layer->weight_grads().div(scale);
@@ -253,21 +218,9 @@ void train(int rank, int world_size, Dataset& train_data,
                 optimizer.step(model.layer2());
                 optimizer.step(model.layer1());
 
-                CUDACHECK(cudaMemsetAsync(accum_buf_upper.data(), 0,
-                                          accum_buf_upper.bytes(), get_cuda_stream()));
-                CUDACHECK(cudaMemsetAsync(accum_buf_lower.data(), 0,
-                                          accum_buf_lower.bytes(), get_cuda_stream()));
+                CUDACHECK(cudaMemsetAsync(accum_buf.data(), 0,
+                                          accum_buf.bytes(), get_cuda_stream()));
                 accum_count = 0;
-            }
-            else
-            {
-                // ---- Non-final step: accumulate without communicating ----
-                model.backward();
-                pack(grad_buf_upper, upper_grads);
-                accum_buf_upper.accumulate(grad_buf_upper, get_cuda_stream());
-                pack(grad_buf_lower, lower_grads);
-                accum_buf_lower.accumulate(grad_buf_lower, get_cuda_stream());
-                ++accum_count;
             }
 
             ++batch_count;
@@ -281,17 +234,16 @@ void train(int rank, int world_size, Dataset& train_data,
 
         if (rank == 0)
         {
-            // compute_ms and comm_ms overlap, so their sum overstates wall time.
             std::printf("Epoch %d complete | avg loss = %.6f | acc = %.4f\n",
                         epoch + 1, model.avg_loss(), model.accuracy());
-            std::printf("  compute = %.1f ms | comm = %.1f ms (overlap) | comm %% = %.1f%%\n",
+            std::printf("  compute = %.1f ms | comm = %.1f ms | total = %.1f ms | comm %% = %.1f%%\n",
                         epoch_compute_ms, epoch_comm_ms,
+                        epoch_compute_ms + epoch_comm_ms,
                         100.0f * epoch_comm_ms / (epoch_compute_ms + epoch_comm_ms));
         }
     }
 
     CUDACHECK(cudaEventDestroy(iter_start));
-    CUDACHECK(cudaEventDestroy(layer3_ready));
     CUDACHECK(cudaEventDestroy(compute_end));
     CUDACHECK(cudaEventDestroy(comm_start));
     CUDACHECK(cudaEventDestroy(comm_end));
