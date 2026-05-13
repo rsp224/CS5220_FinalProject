@@ -124,6 +124,7 @@ if (USE_MPI)
     target_link_libraries(train_dist PRIVATE
         CUDA::cudart
         CUDA::cublas
+        CUDA::nvtx3
         MPI::MPI_CXX
         NCCL::NCCL
     )

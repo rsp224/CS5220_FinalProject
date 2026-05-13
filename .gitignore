@@ -21,3 +21,6 @@ Makefile
 .vscode/
 
 build*/
+
+data/
+prof/

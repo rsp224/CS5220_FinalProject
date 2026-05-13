@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <cstdlib>
+#include <nvtx3/nvToolsExt.h>
 
 #define MPICHECK(cmd)                                                        \
     do                                                                       \
@@ -164,15 +165,27 @@ void train(int rank, int world_size, Dataset& train_data,
 
         while (data_loader.next_batch(host_images, host_labels))
         {
+            nvtxRangePushA("iter");
+
+            nvtxRangePushA("h2d");
             batch_x.copy_from_host(host_images);
             batch_y.copy_from_host(host_labels);
+            nvtxRangePop();
 
             CUDACHECK(cudaEventRecord(iter_start, get_cuda_stream()));
 
+            nvtxRangePushA("fwd");
             float loss = model.forward(batch_x, batch_y);
+            nvtxRangePop();
+
+            nvtxRangePushA("bwd");
             model.backward();
+            nvtxRangePop();
+
+            nvtxRangePushA("pack");
             pack();
             accum_buf.accumulate(grad_buf, get_cuda_stream());
+            nvtxRangePop();
 
             CUDACHECK(cudaEventRecord(compute_end, get_cuda_stream()));
 
@@ -180,10 +193,13 @@ void train(int rank, int world_size, Dataset& train_data,
 
             if (accum_count == accum_steps)
             {
+                nvtxRangePushA("sync_pre");
                 CUDACHECK(cudaStreamSynchronize(get_cuda_stream()));
+                nvtxRangePop();
 
                 CUDACHECK(cudaEventRecord(comm_start, get_cuda_stream()));
 
+                nvtxRangePushA("allreduce");
                 int off = 0;
                 while (off < total_elems)
                 {
@@ -194,9 +210,13 @@ void train(int rank, int world_size, Dataset& train_data,
                                             get_cuda_stream()));
                     off += count;
                 }
+                nvtxRangePop();
 
                 CUDACHECK(cudaEventRecord(comm_end, get_cuda_stream()));
+
+                nvtxRangePushA("sync_post");
                 CUDACHECK(cudaStreamSynchronize(get_cuda_stream()));
+                nvtxRangePop();
 
                 float compute_ms, comm_ms;
                 CUDACHECK(cudaEventElapsedTime(&compute_ms, iter_start, compute_end));
@@ -205,9 +225,12 @@ void train(int rank, int world_size, Dataset& train_data,
                 epoch_comm_ms += comm_ms;
 
                 const float scale = static_cast<float>(world_size * accum_steps);
+                nvtxRangePushA("unpack");
                 unpack();
                 CUDACHECK(cudaStreamSynchronize(get_cuda_stream()));
+                nvtxRangePop();
 
+                nvtxRangePushA("opt");
                 for (FFLayer *layer : model.layers())
                 {
                     layer->weight_grads().div(scale);
@@ -217,6 +240,7 @@ void train(int rank, int world_size, Dataset& train_data,
                 optimizer.step(model.layer3());
                 optimizer.step(model.layer2());
                 optimizer.step(model.layer1());
+                nvtxRangePop();
 
                 CUDACHECK(cudaMemsetAsync(accum_buf.data(), 0,
                                           accum_buf.bytes(), get_cuda_stream()));
@@ -224,6 +248,8 @@ void train(int rank, int world_size, Dataset& train_data,
             }
 
             ++batch_count;
+
+            nvtxRangePop();
 
             if (rank == 0 && batch_count % 100 == 0)
             {
