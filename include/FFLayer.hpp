@@ -19,7 +19,8 @@ public:
     void init(unsigned int seed);
 
     void forward(const Tensor& input, Tensor& output);
-    void backward(const Tensor& grad_output, Tensor& grad_input);
+    void backward_parameter_grads(const Tensor& grad_output);
+    void backward_input_grad(Tensor& grad_input);
 
     Tensor& weights() noexcept { return W_; }
     Tensor& biases() noexcept { return b_; }

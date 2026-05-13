@@ -135,7 +135,7 @@ void FFLayer::forward(const Tensor &input, Tensor &output)
     int batch = input.rows();
 
     input_cache_.resize_like(input);
-    input_cache_.copy_from_device(input);
+    input_cache_.copy_from_device(input, get_cuda_stream());
 
     preact_cache_.resize(batch, output_size_);
     output_cache_.resize(batch, output_size_);
@@ -191,19 +191,18 @@ void FFLayer::forward(const Tensor &input, Tensor &output)
     }
     else
     {
-        output_cache_.copy_from_device(preact_cache_);
+        output_cache_.copy_from_device(preact_cache_, get_cuda_stream());
     }
 
     output.resize_like(output_cache_);
-    output.copy_from_device(output_cache_);
+    output.copy_from_device(output_cache_, get_cuda_stream());
 }
 
-void FFLayer::backward(const Tensor &grad_output, Tensor &grad_input)
+void FFLayer::backward_parameter_grads(const Tensor &grad_output)
 {
     int batch = grad_output.rows();
 
     act_grad_cache_.resize_like(grad_output);
-    grad_input.resize(batch, input_size_);
 
     int total = batch * output_size_;
     int threads = 256;
@@ -220,7 +219,7 @@ void FFLayer::backward(const Tensor &grad_output, Tensor &grad_input)
     }
     else
     {
-        act_grad_cache_.copy_from_device(grad_output);
+        act_grad_cache_.copy_from_device(grad_output, get_cuda_stream());
     }
 
     // db_ = sum_rows(act_grad_cache_)
@@ -260,6 +259,17 @@ void FFLayer::backward(const Tensor &grad_output, Tensor &grad_input)
             &beta,
             dW_.data(), output_size_),
         "cublasSgemm dW failed");
+}
+
+void FFLayer::backward_input_grad(Tensor &grad_input)
+{
+    int batch = act_grad_cache_.rows();
+    grad_input.resize(batch, input_size_);
+
+    cublasHandle_t handle = get_cublas_handle();
+
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
 
     // grad_input = act_grad_cache_ * W_^T
     // Shapes:

@@ -25,6 +25,7 @@ public:
     std::vector<float> copy_to_host() const;
 
     void copy_from_device(const Tensor& other);
+    void copy_from_device(const Tensor& other, cudaStream_t stream);
 
     float* data() noexcept;
     const float* data() const noexcept;
@@ -35,7 +36,12 @@ public:
     std::size_t bytes() const noexcept;
 
     void div(float scalar);
-    void accumulate(const Tensor& other, cudaStream_t stream);
+    void div(float scalar, cudaStream_t stream);
+    void accumulate_slice(const Tensor& other,
+                          std::size_t dst_offset,
+                          std::size_t src_offset,
+                          std::size_t count,
+                          cudaStream_t stream);
 
 private:
     void free();

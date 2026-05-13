@@ -15,8 +15,13 @@ public:
 
     float forward(const Tensor& input, const Tensor& target);
     void backward();
-    void backward_upper();  // loss + layer3; produces layer3 grads and grad_hidden2_
-    void backward_lower();  // layer2 + layer1; must follow backward_upper()
+    void backward_loss();
+    void backward_layer3_grads();
+    void backward_layer3_input();
+    void backward_layer2_grads();
+    void backward_layer2_input();
+    void backward_layer1_grads();
+    void backward_layer1_input();
 
     void save(const std::string& filename) const;
     void load(const std::string& filename);

@@ -143,6 +143,19 @@ void Tensor::copy_from_device(const Tensor& other) {
     );
 }
 
+void Tensor::copy_from_device(const Tensor& other, cudaStream_t stream) {
+    if (other.data_ == nullptr) {
+        throw std::runtime_error("Source tensor is unallocated.");
+    }
+
+    resize(other.rows_, other.cols_);
+
+    check_cuda(
+        cudaMemcpyAsync(data_, other.data_, bytes(), cudaMemcpyDeviceToDevice, stream),
+        "cudaMemcpyAsync device to device failed"
+    );
+}
+
 float* Tensor::data() noexcept {
     return data_;
 }
@@ -184,19 +197,30 @@ __global__ void add_kernel(float* dst, const float* src, std::size_t n) {
     }
 }
 
-void Tensor::accumulate(const Tensor& other, cudaStream_t stream) {
+void Tensor::accumulate_slice(const Tensor& other,
+                              std::size_t dst_offset,
+                              std::size_t src_offset,
+                              std::size_t count,
+                              cudaStream_t stream) {
     if (data_ == nullptr || other.data_ == nullptr) {
         throw std::runtime_error("Cannot accumulate into/from an unallocated tensor.");
     }
-    if (size_ != other.size_) {
-        throw std::runtime_error("Tensor size mismatch in accumulate.");
+    if (dst_offset + count > size_ || src_offset + count > other.size_) {
+        throw std::runtime_error("Tensor slice out of bounds in accumulate_slice.");
+    }
+    if (count == 0) {
+        return;
     }
 
     const int threads = 256;
-    const int blocks = static_cast<int>((size_ + threads - 1) / threads);
+    const int blocks = static_cast<int>((count + threads - 1) / threads);
 
-    add_kernel<<<blocks, threads, 0, stream>>>(data_, other.data_, size_);
-    check_cuda(cudaGetLastError(), "add_kernel launch failed");
+    add_kernel<<<blocks, threads, 0, stream>>>(
+        data_ + dst_offset,
+        other.data_ + src_offset,
+        count
+    );
+    check_cuda(cudaGetLastError(), "add_kernel slice launch failed");
 }
 
 __global__ void div_kernel(float* data, std::size_t n, float scalar) {
@@ -207,6 +231,11 @@ __global__ void div_kernel(float* data, std::size_t n, float scalar) {
 }
 
 void Tensor::div(float scalar) {
+    div(scalar, 0);
+    check_cuda(cudaDeviceSynchronize(), "div_kernel sync failed");
+}
+
+void Tensor::div(float scalar, cudaStream_t stream) {
     if (data_ == nullptr) {
         throw std::runtime_error("Cannot divide an unallocated tensor.");
     }
@@ -217,7 +246,6 @@ void Tensor::div(float scalar) {
     const int threads = 256;
     const int blocks = static_cast<int>((size_ + threads - 1) / threads);
 
-    div_kernel<<<blocks, threads>>>(data_, size_, scalar);
+    div_kernel<<<blocks, threads, 0, stream>>>(data_, size_, scalar);
     check_cuda(cudaGetLastError(), "div_kernel launch failed");
-    check_cuda(cudaDeviceSynchronize(), "div_kernel sync failed");
 }

@@ -38,24 +38,49 @@ float Model::forward(const Tensor& input, const Tensor& target)
 
 void Model::backward()
 {
-    loss_.backward(grad_logits_);
-    layer3_.backward(grad_logits_, grad_hidden2_);
-    layer2_.backward(grad_hidden2_, grad_hidden_);
-    layer1_.backward(grad_hidden_, grad_input_);
+    backward_loss();
+    backward_layer3_grads();
+    backward_layer3_input();
+    backward_layer2_grads();
+    backward_layer2_input();
+    backward_layer1_grads();
+    backward_layer1_input();
 }
 
-void Model::backward_upper()
+void Model::backward_loss()
 {
     loss_.backward(grad_logits_);
-    layer3_.backward(grad_logits_, grad_hidden2_);
 }
 
-void Model::backward_lower()
+void Model::backward_layer3_grads()
 {
-    layer2_.backward(grad_hidden2_, grad_hidden_);
-    layer1_.backward(grad_hidden_, grad_input_);
+    layer3_.backward_parameter_grads(grad_logits_);
 }
 
+void Model::backward_layer3_input()
+{
+    layer3_.backward_input_grad(grad_hidden2_);
+}
+
+void Model::backward_layer2_grads()
+{
+    layer2_.backward_parameter_grads(grad_hidden2_);
+}
+
+void Model::backward_layer2_input()
+{
+    layer2_.backward_input_grad(grad_hidden_);
+}
+
+void Model::backward_layer1_grads()
+{
+    layer1_.backward_parameter_grads(grad_hidden_);
+}
+
+void Model::backward_layer1_input()
+{
+    layer1_.backward_input_grad(grad_input_);
+}
 
 float Model::avg_loss() const noexcept
 {
