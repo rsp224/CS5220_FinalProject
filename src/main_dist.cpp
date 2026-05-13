@@ -180,11 +180,13 @@ void train(int rank, int world_size, Dataset& train_data,
 
             nvtxRangePushA("bwd");
             model.backward();
+            CUDACHECK(cudaStreamSynchronize(get_cuda_stream()));
             nvtxRangePop();
 
             nvtxRangePushA("pack");
             pack();
             accum_buf.accumulate(grad_buf, get_cuda_stream());
+            CUDACHECK(cudaStreamSynchronize(get_cuda_stream()));
             nvtxRangePop();
 
             CUDACHECK(cudaEventRecord(compute_end, get_cuda_stream()));
@@ -193,10 +195,6 @@ void train(int rank, int world_size, Dataset& train_data,
 
             if (accum_count == accum_steps)
             {
-                nvtxRangePushA("sync_pre");
-                CUDACHECK(cudaStreamSynchronize(get_cuda_stream()));
-                nvtxRangePop();
-
                 CUDACHECK(cudaEventRecord(comm_start, get_cuda_stream()));
 
                 nvtxRangePushA("allreduce");
@@ -210,13 +208,10 @@ void train(int rank, int world_size, Dataset& train_data,
                                             get_cuda_stream()));
                     off += count;
                 }
+                CUDACHECK(cudaStreamSynchronize(get_cuda_stream()));
                 nvtxRangePop();
 
                 CUDACHECK(cudaEventRecord(comm_end, get_cuda_stream()));
-
-                nvtxRangePushA("sync_post");
-                CUDACHECK(cudaStreamSynchronize(get_cuda_stream()));
-                nvtxRangePop();
 
                 float compute_ms, comm_ms;
                 CUDACHECK(cudaEventElapsedTime(&compute_ms, iter_start, compute_end));
@@ -240,6 +235,7 @@ void train(int rank, int world_size, Dataset& train_data,
                 optimizer.step(model.layer3());
                 optimizer.step(model.layer2());
                 optimizer.step(model.layer1());
+                CUDACHECK(cudaStreamSynchronize(get_cuda_stream()));
                 nvtxRangePop();
 
                 CUDACHECK(cudaMemsetAsync(accum_buf.data(), 0,
@@ -249,6 +245,7 @@ void train(int rank, int world_size, Dataset& train_data,
 
             ++batch_count;
 
+            CUDACHECK(cudaStreamSynchronize(get_cuda_stream()));
             nvtxRangePop();
 
             if (rank == 0 && batch_count % 100 == 0)
