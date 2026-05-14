@@ -8,70 +8,89 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include "Stream.hpp"
 
-namespace {
+namespace
+{
 
-void check_cuda(cudaError_t err, const char* msg) {
-    if (err != cudaSuccess) {
-        throw std::runtime_error(std::string(msg) + ": " + cudaGetErrorString(err));
-    }
-}
-
-void check_cublas(cublasStatus_t status, const char* msg) {
-    if (status != CUBLAS_STATUS_SUCCESS) {
-        throw std::runtime_error(std::string(msg));
-    }
-}
-
-cublasHandle_t get_cublas_handle() {
-    static cublasHandle_t handle = nullptr;
-    static bool initialized = false;
-
-    if (!initialized) {
-        check_cublas(cublasCreate(&handle), "cublasCreate failed");
-        initialized = true;
-    }
-    return handle;
-}
-
-__global__ void add_bias_kernel(float* z, const float* b, int rows, int cols) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = rows * cols;
-    if (idx < total) {
-        int col = idx % cols;
-        z[idx] += b[col];
-    }
-}
-
-__global__ void relu_forward_kernel(const float* z, float* a, int n) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) {
-        a[idx] = z[idx] > 0.0f ? z[idx] : 0.0f;
-    }
-}
-
-__global__ void relu_backward_kernel(const float* z,
-                                     const float* grad_out,
-                                     float* grad_z,
-                                     int n) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) {
-        grad_z[idx] = z[idx] > 0.0f ? grad_out[idx] : 0.0f;
-    }
-}
-
-__global__ void sum_rows_kernel(const float* x, float* out, int rows, int cols) {
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
-    if (col < cols) {
-        float sum = 0.0f;
-        for (int r = 0; r < rows; ++r) {
-            sum += x[r * cols + col];
+    void check_cuda(cudaError_t err, const char *msg)
+    {
+        if (err != cudaSuccess)
+        {
+            throw std::runtime_error(std::string(msg) + ": " + cudaGetErrorString(err));
         }
-        out[col] = sum;
     }
-}
 
-}  // namespace
+    void check_cublas(cublasStatus_t status, const char *msg)
+    {
+        if (status != CUBLAS_STATUS_SUCCESS)
+        {
+            throw std::runtime_error(std::string(msg));
+        }
+    }
+
+    cublasHandle_t get_cublas_handle()
+    {
+        static cublasHandle_t handle = nullptr;
+        static bool initialized = false;
+
+        if (!initialized)
+        {
+            check_cublas(cublasCreate(&handle), "cublasCreate failed");
+            cudaStream_t stream = get_cuda_stream();
+            cublasSetStream(handle, stream);
+            initialized = true;
+        }
+        return handle;
+    }
+
+    __global__ void add_bias_kernel(float *z, const float *b, int rows, int cols)
+    {
+        int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        int total = rows * cols;
+        if (idx < total)
+        {
+            int col = idx % cols;
+            z[idx] += b[col];
+        }
+    }
+
+    __global__ void relu_forward_kernel(const float *z, float *a, int n)
+    {
+        int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx < n)
+        {
+            a[idx] = z[idx] > 0.0f ? z[idx] : 0.0f;
+        }
+    }
+
+    __global__ void relu_backward_kernel(const float *z,
+                                         const float *grad_out,
+                                         float *grad_z,
+                                         int n)
+    {
+        int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx < n)
+        {
+            grad_z[idx] = z[idx] > 0.0f ? grad_out[idx] : 0.0f;
+        }
+    }
+
+    __global__ void sum_rows_kernel(const float *x, float *out, int rows, int cols)
+    {
+        int col = blockIdx.x * blockDim.x + threadIdx.x;
+        if (col < cols)
+        {
+            float sum = 0.0f;
+            for (int r = 0; r < rows; ++r)
+            {
+                sum += x[r * cols + col];
+            }
+            out[col] = sum;
+        }
+    }
+
+} // namespace
 
 FFLayer::FFLayer(std::string name,
                  Activation activation,
@@ -86,19 +105,21 @@ FFLayer::FFLayer(std::string name,
       dW_(input_size, output_size),
       db_(1, output_size) {}
 
-void FFLayer::init(unsigned int seed) {
+void FFLayer::init(unsigned int seed)
+{
     std::mt19937 rng(seed);
 
     std::vector<float> host_w(W_.size());
     std::vector<float> host_b(b_.size(), 0.01f);
 
     float sigma = (activation_ == Activation::ReLU)
-        ? std::sqrt(2.0f / static_cast<float>(input_size_))
-        : std::sqrt(1.0f / static_cast<float>(input_size_));
+                      ? std::sqrt(2.0f / static_cast<float>(input_size_))
+                      : std::sqrt(1.0f / static_cast<float>(input_size_));
 
     std::normal_distribution<float> dist(0.0f, sigma);
 
-    for (std::size_t i = 0; i < host_w.size(); ++i) {
+    for (std::size_t i = 0; i < host_w.size(); ++i)
+    {
         host_w[i] = dist(rng);
     }
 
@@ -109,7 +130,8 @@ void FFLayer::init(unsigned int seed) {
     db_.zero();
 }
 
-void FFLayer::forward(const Tensor& input, Tensor& output) {
+void FFLayer::forward(const Tensor &input, Tensor &output)
+{
     int batch = input.rows();
 
     input_cache_.resize_like(input);
@@ -138,40 +160,37 @@ void FFLayer::forward(const Tensor& input, Tensor& output) {
             handle,
             CUBLAS_OP_N,
             CUBLAS_OP_N,
-            output_size_,         // m
-            batch,                // n
-            input_size_,          // k
+            output_size_, // m
+            batch,        // n
+            input_size_,  // k
             &alpha,
             W_.data(), output_size_,
             input.data(), input_size_,
             &beta,
-            preact_cache_.data(), output_size_
-        ),
-        "cublasSgemm forward failed"
-    );
+            preact_cache_.data(), output_size_),
+        "cublasSgemm forward failed");
 
     int total = batch * output_size_;
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
 
-    add_bias_kernel<<<blocks, threads>>>(
+    add_bias_kernel<<<blocks, threads, 0, get_cuda_stream()>>>(
         preact_cache_.data(),
         b_.data(),
         batch,
-        output_size_
-    );
+        output_size_);
     check_cuda(cudaGetLastError(), "add_bias_kernel launch failed");
-    check_cuda(cudaDeviceSynchronize(), "add_bias_kernel sync failed");
 
-    if (activation_ == Activation::ReLU) {
-        relu_forward_kernel<<<blocks, threads>>>(
+    if (activation_ == Activation::ReLU)
+    {
+        relu_forward_kernel<<<blocks, threads, 0, get_cuda_stream()>>>(
             preact_cache_.data(),
             output_cache_.data(),
-            total
-        );
+            total);
         check_cuda(cudaGetLastError(), "relu_forward_kernel launch failed");
-        check_cuda(cudaDeviceSynchronize(), "relu_forward_kernel sync failed");
-    } else {
+    }
+    else
+    {
         output_cache_.copy_from_device(preact_cache_);
     }
 
@@ -179,7 +198,8 @@ void FFLayer::forward(const Tensor& input, Tensor& output) {
     output.copy_from_device(output_cache_);
 }
 
-void FFLayer::backward(const Tensor& grad_output, Tensor& grad_input) {
+void FFLayer::backward(const Tensor &grad_output, Tensor &grad_input)
+{
     int batch = grad_output.rows();
 
     act_grad_cache_.resize_like(grad_output);
@@ -189,16 +209,17 @@ void FFLayer::backward(const Tensor& grad_output, Tensor& grad_input) {
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
 
-    if (activation_ == Activation::ReLU) {
-        relu_backward_kernel<<<blocks, threads>>>(
+    if (activation_ == Activation::ReLU)
+    {
+        relu_backward_kernel<<<blocks, threads, 0, get_cuda_stream()>>>(
             preact_cache_.data(),
             grad_output.data(),
             act_grad_cache_.data(),
-            total
-        );
+            total);
         check_cuda(cudaGetLastError(), "relu_backward_kernel launch failed");
-        check_cuda(cudaDeviceSynchronize(), "relu_backward_kernel sync failed");
-    } else {
+    }
+    else
+    {
         act_grad_cache_.copy_from_device(grad_output);
     }
 
@@ -207,14 +228,12 @@ void FFLayer::backward(const Tensor& grad_output, Tensor& grad_input) {
         int bias_threads = 256;
         int bias_blocks = (output_size_ + bias_threads - 1) / bias_threads;
 
-        sum_rows_kernel<<<bias_blocks, bias_threads>>>(
+        sum_rows_kernel<<<bias_blocks, bias_threads, 0, get_cuda_stream()>>>(
             act_grad_cache_.data(),
             db_.data(),
             batch,
-            output_size_
-        );
+            output_size_);
         check_cuda(cudaGetLastError(), "sum_rows_kernel launch failed");
-        check_cuda(cudaDeviceSynchronize(), "sum_rows_kernel sync failed");
     }
 
     cublasHandle_t handle = get_cublas_handle();
@@ -232,17 +251,15 @@ void FFLayer::backward(const Tensor& grad_output, Tensor& grad_input) {
             handle,
             CUBLAS_OP_N,
             CUBLAS_OP_T,
-            output_size_,          // m
-            input_size_,           // n
-            batch,                 // k
+            output_size_, // m
+            input_size_,  // n
+            batch,        // k
             &alpha,
             act_grad_cache_.data(), output_size_,
             input_cache_.data(), input_size_,
             &beta,
-            dW_.data(), output_size_
-        ),
-        "cublasSgemm dW failed"
-    );
+            dW_.data(), output_size_),
+        "cublasSgemm dW failed");
 
     // grad_input = act_grad_cache_ * W_^T
     // Shapes:
@@ -254,15 +271,13 @@ void FFLayer::backward(const Tensor& grad_output, Tensor& grad_input) {
             handle,
             CUBLAS_OP_T,
             CUBLAS_OP_N,
-            input_size_,           // m
-            batch,                 // n
-            output_size_,          // k
+            input_size_,  // m
+            batch,        // n
+            output_size_, // k
             &alpha,
             W_.data(), output_size_,
             act_grad_cache_.data(), output_size_,
             &beta,
-            grad_input.data(), input_size_
-        ),
-        "cublasSgemm grad_input failed"
-    );
+            grad_input.data(), input_size_),
+        "cublasSgemm grad_input failed");
 }

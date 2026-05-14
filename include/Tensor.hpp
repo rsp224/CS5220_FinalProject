@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <driver_types.h>
 #include <vector>
 
 class Tensor {
@@ -32,6 +33,9 @@ public:
     int cols() const noexcept;
     std::size_t size() const noexcept;
     std::size_t bytes() const noexcept;
+
+    void div(float scalar);
+    void accumulate(const Tensor& other, cudaStream_t stream);
 
 private:
     void free();

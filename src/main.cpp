@@ -1,10 +1,12 @@
 #include "MNIST.hpp"
 #include "Model.hpp"
 #include "SGDOptimizer.hpp"
+#include "Stream.hpp"
 #include "Tensor.hpp"
 
 #include <cstdio>
 #include <cstring>
+#include <cuda_runtime.h>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -40,6 +42,10 @@ void train(const char* data_dir, const char* output_path) {
     std::vector<float> host_images;
     std::vector<float> host_labels;
 
+    cudaEvent_t iter_start, compute_end;
+    cudaEventCreate(&iter_start);
+    cudaEventCreate(&compute_end);
+
     for (int epoch = 0; epoch < num_epochs; ++epoch) {
         std::printf("Epoch %d\n", epoch + 1);
 
@@ -47,13 +53,23 @@ void train(const char* data_dir, const char* output_path) {
         model.reset_score();
 
         int batch_count = 0;
+        float epoch_compute_ms = 0.0f;
 
         while (train_data.next_batch(batch_size, host_images, host_labels)) {
             batch_x.copy_from_host(host_images);
             batch_y.copy_from_host(host_labels);
 
+            cudaEventRecord(iter_start, get_cuda_stream());
+
             float loss = model.forward(batch_x, batch_y);
             model.backward();
+
+            cudaEventRecord(compute_end, get_cuda_stream());
+            cudaStreamSynchronize(get_cuda_stream());
+
+            float compute_ms;
+            cudaEventElapsedTime(&compute_ms, iter_start, compute_end);
+            epoch_compute_ms += compute_ms;
 
             optimizer.step(model.layer2());
             optimizer.step(model.layer1());
@@ -68,7 +84,11 @@ void train(const char* data_dir, const char* output_path) {
 
         std::printf("Epoch %d complete | avg loss = %.6f | acc = %.4f\n",
                     epoch + 1, model.avg_loss(), model.accuracy());
+        std::printf("  compute = %.1f ms\n", epoch_compute_ms);
     }
+
+    cudaEventDestroy(iter_start);
+    cudaEventDestroy(compute_end);
 
     model.save(output_path);
     std::printf("Saved model to %s\n", output_path);

@@ -19,3 +19,8 @@ Makefile
 
 # VSCode
 .vscode/
+
+build*/
+
+data/
+prof/
