@@ -208,10 +208,9 @@ void train(int rank, int world_size, Dataset& train_data,
                                             get_cuda_stream()));
                     off += count;
                 }
+                CUDACHECK(cudaEventRecord(comm_end, get_cuda_stream()));
                 CUDACHECK(cudaStreamSynchronize(get_cuda_stream()));
                 nvtxRangePop();
-
-                CUDACHECK(cudaEventRecord(comm_end, get_cuda_stream()));
 
                 float compute_ms, comm_ms;
                 CUDACHECK(cudaEventElapsedTime(&compute_ms, iter_start, compute_end));
