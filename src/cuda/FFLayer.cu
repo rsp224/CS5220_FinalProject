@@ -103,7 +103,9 @@ FFLayer::FFLayer(std::string name,
       W_(input_size, output_size),
       b_(1, output_size),
       dW_(input_size, output_size),
-      db_(1, output_size) {}
+      db_(1, output_size),
+      dW_accum_(input_size, output_size),
+      db_accum_(1, output_size) {}
 
 void FFLayer::init(unsigned int seed)
 {
@@ -259,6 +261,20 @@ void FFLayer::backward_parameter_grads(const Tensor &grad_output)
             &beta,
             dW_.data(), output_size_),
         "cublasSgemm dW failed");
+}
+
+void FFLayer::zero_grad_accum(cudaStream_t stream)
+{
+    check_cuda(cudaMemsetAsync(dW_accum_.data(), 0, dW_accum_.bytes(), stream),
+               "cudaMemsetAsync dW_accum_ failed");
+    check_cuda(cudaMemsetAsync(db_accum_.data(), 0, db_accum_.bytes(), stream),
+               "cudaMemsetAsync db_accum_ failed");
+}
+
+void FFLayer::accumulate_grads(cudaStream_t stream)
+{
+    dW_accum_.accumulate_slice(dW_, 0, 0, dW_.size(), stream);
+    db_accum_.accumulate_slice(db_, 0, 0, db_.size(), stream);
 }
 
 void FFLayer::backward_input_grad(Tensor &grad_input)

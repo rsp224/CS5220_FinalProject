@@ -8,7 +8,6 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstring>
-#include <limits>
 #include <mpi.h>
 #include <nccl.h>
 #include <stdio.h>
@@ -57,8 +56,6 @@
 
 static constexpr int batch_size = 1600;
 static constexpr int default_num_epochs = 10;
-static constexpr std::size_t default_overlap_bucket_elems =
-    (25 * 1024 * 1024) / sizeof(float);
 
 enum class TrainMode {
     Sync,
@@ -68,73 +65,6 @@ enum class TrainMode {
 const char *mode_name(TrainMode mode)
 {
     return mode == TrainMode::Overlap ? "overlap" : "sync";
-}
-
-struct GradSpec {
-    Tensor *tensor;
-    std::size_t flat_offset;
-    int stage;
-};
-
-struct BucketSegment {
-    Tensor *tensor;
-    std::size_t tensor_offset;
-    std::size_t flat_offset;
-    std::size_t count;
-    int stage;
-};
-
-struct GradBucket {
-    std::size_t flat_offset = 0;
-    std::size_t count = 0;
-    int ready_stage = 0;
-    cudaEvent_t comm_start = nullptr;
-    cudaEvent_t comm_end = nullptr;
-    std::vector<BucketSegment> segments;
-};
-
-std::vector<GradBucket> build_buckets(const std::vector<GradSpec>& specs,
-                                      std::size_t bucket_size)
-{
-    std::vector<GradBucket> buckets;
-    std::size_t flat_offset = 0;
-
-    for (const GradSpec& spec : specs)
-    {
-        std::size_t tensor_offset = 0;
-        std::size_t remaining = spec.tensor->size();
-
-        while (remaining > 0)
-        {
-            if (buckets.empty() || buckets.back().count == bucket_size)
-            {
-                GradBucket bucket;
-                bucket.flat_offset = flat_offset;
-                bucket.ready_stage = spec.stage;
-                buckets.push_back(std::move(bucket));
-            }
-
-            GradBucket& bucket = buckets.back();
-            const std::size_t space = bucket_size - bucket.count;
-            const std::size_t count = std::min(space, remaining);
-
-            bucket.segments.push_back(BucketSegment{
-                spec.tensor,
-                tensor_offset,
-                flat_offset,
-                count,
-                spec.stage
-            });
-            bucket.count += count;
-            bucket.ready_stage = std::max(bucket.ready_stage, spec.stage);
-
-            tensor_offset += count;
-            flat_offset += count;
-            remaining -= count;
-        }
-    }
-
-    return buckets;
 }
 
 Model create_model(int rank, int local_batch_size, int input_dim, int output_dim,
@@ -163,7 +93,7 @@ Model create_model(int rank, int local_batch_size, int input_dim, int output_dim
 template<typename Dataset>
 void train(int rank, int world_size, Dataset& train_data,
            const char *output_path, ncclComm_t comm, int input_dim, int output_dim,
-           int hidden_dim, long long bucket_size_arg, int accum_steps,
+           int hidden_dim, int accum_steps,
            const char *algo, float learning_rate, TrainMode mode, int epochs)
 {
     std::printf("Executing training routine\n");
@@ -188,128 +118,65 @@ void train(int rank, int world_size, Dataset& train_data,
 
     DistributedDataLoader data_loader(train_data, rank, world_size, batch_size, 42);
 
-    std::vector<GradSpec> grad_specs = {
-        {&model.layer3().weight_grads(), 0, 0},
-        {&model.layer3().bias_grads(), 0, 0},
-        {&model.layer2().weight_grads(), 0, 1},
-        {&model.layer2().bias_grads(), 0, 1},
-        {&model.layer1().weight_grads(), 0, 2},
-        {&model.layer1().bias_grads(), 0, 2}
-    };
-
-    std::size_t total_elems = 0;
-    for (GradSpec& spec : grad_specs)
-    {
-        spec.flat_offset = total_elems;
-        total_elems += spec.tensor->size();
-    }
-
-    if (total_elems > static_cast<std::size_t>(std::numeric_limits<int>::max()))
-    {
-        if (rank == 0)
-            std::printf("Total gradient buffer is too large for Tensor dimensions: %zu elements\n",
-                        total_elems);
-        MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
-    }
-
-    std::size_t bucket_size = 0;
-    if (bucket_size_arg <= 0)
-        bucket_size = (mode == TrainMode::Overlap) ? default_overlap_bucket_elems : total_elems;
-    else
-        bucket_size = static_cast<std::size_t>(bucket_size_arg);
-
-    bucket_size = std::max<std::size_t>(1, std::min(bucket_size, total_elems));
-
-    std::vector<GradBucket> buckets = build_buckets(grad_specs, bucket_size);
-
-    Tensor accum_buf(1, static_cast<int>(total_elems));
-
-    if (rank == 0)
-        std::printf("Total grad elems: %zu | bucket_size: %zu (%zu buckets)\n",
-                    total_elems, bucket_size,
-                    buckets.size());
-
-    for (GradBucket& bucket : buckets)
-    {
-        CUDACHECK(cudaEventCreate(&bucket.comm_start));
-        CUDACHECK(cudaEventCreate(&bucket.comm_end));
-    }
-
     cudaEvent_t iter_start, iter_end, compute_end;
     cudaEvent_t wait_start, wait_end, comm_done;
-    cudaEvent_t stage_ready[3];
+    cudaEvent_t layer_ready[3];
+    cudaEvent_t layer_comm_start[3], layer_comm_end[3];
     CUDACHECK(cudaEventCreate(&iter_start));
     CUDACHECK(cudaEventCreate(&iter_end));
     CUDACHECK(cudaEventCreate(&compute_end));
     CUDACHECK(cudaEventCreate(&wait_start));
     CUDACHECK(cudaEventCreate(&wait_end));
     CUDACHECK(cudaEventCreateWithFlags(&comm_done, cudaEventDisableTiming));
-    for (cudaEvent_t& event : stage_ready)
+    for (cudaEvent_t& event : layer_ready)
         CUDACHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
-
-    auto accumulate_stage = [&](int stage)
+    for (int i = 0; i < 3; ++i)
     {
-        for (const GradBucket& bucket : buckets)
-        {
-            for (const BucketSegment& segment : bucket.segments)
-            {
-                if (segment.stage == stage)
-                {
-                    accum_buf.accumulate_slice(*segment.tensor,
-                                               segment.flat_offset,
-                                               segment.tensor_offset,
-                                               segment.count,
-                                               compute_stream);
-                }
-            }
-        }
-    };
+        CUDACHECK(cudaEventCreate(&layer_comm_start[i]));
+        CUDACHECK(cudaEventCreate(&layer_comm_end[i]));
+    }
 
-    auto unpack = [&]()
-    {
-        for (const GradSpec& spec : grad_specs)
-        {
-            CUDACHECK(cudaMemcpyAsync(spec.tensor->data(),
-                                      accum_buf.data() + spec.flat_offset,
-                                      spec.tensor->size() * sizeof(float),
-                                      cudaMemcpyDeviceToDevice,
-                                      compute_stream));
-        }
-    };
+    // Layers are allreduced in backward order: layer3 first (slot 0),
+    // then layer2 (slot 1), then layer1 (slot 2).
+    FFLayer* ordered_layers[3] = {&model.layer3(), &model.layer2(), &model.layer1()};
 
     auto launch_sync_allreduce = [&]()
     {
-        for (GradBucket& bucket : buckets)
+        for (int i = 0; i < 3; ++i)
         {
-            CUDACHECK(cudaEventRecord(bucket.comm_start, compute_stream));
-            NCCLCHECK(ncclAllReduce(accum_buf.data() + bucket.flat_offset,
-                                    accum_buf.data() + bucket.flat_offset,
-                                    bucket.count, ncclFloat, ncclSum, comm,
-                                    compute_stream));
-            CUDACHECK(cudaEventRecord(bucket.comm_end, compute_stream));
+            FFLayer* layer = ordered_layers[i];
+            CUDACHECK(cudaEventRecord(layer_comm_start[i], compute_stream));
+            NCCLCHECK(ncclAllReduce(layer->weight_grad_accum().data(),
+                                    layer->weight_grad_accum().data(),
+                                    layer->weight_grad_accum().size(),
+                                    ncclFloat, ncclSum, comm, compute_stream));
+            NCCLCHECK(ncclAllReduce(layer->bias_grad_accum().data(),
+                                    layer->bias_grad_accum().data(),
+                                    layer->bias_grad_accum().size(),
+                                    ncclFloat, ncclSum, comm, compute_stream));
+            CUDACHECK(cudaEventRecord(layer_comm_end[i], compute_stream));
         }
     };
 
-    auto launch_overlap_buckets = [&](int stage, bool final_accum)
+    auto launch_overlap_layer = [&](int slot, bool final_accum)
     {
         if (!final_accum)
             return;
 
-        for (GradBucket& bucket : buckets)
-        {
-            if (bucket.ready_stage != stage)
-                continue;
-
-            CUDACHECK(cudaStreamWaitEvent(comm_stream, stage_ready[stage], 0));
-            nvtxRangePushA("overlap/comm_bucket");
-            CUDACHECK(cudaEventRecord(bucket.comm_start, comm_stream));
-            NCCLCHECK(ncclAllReduce(accum_buf.data() + bucket.flat_offset,
-                                    accum_buf.data() + bucket.flat_offset,
-                                    bucket.count, ncclFloat, ncclSum, comm,
-                                    comm_stream));
-            CUDACHECK(cudaEventRecord(bucket.comm_end, comm_stream));
-            nvtxRangePop();
-        }
+        FFLayer* layer = ordered_layers[slot];
+        CUDACHECK(cudaStreamWaitEvent(comm_stream, layer_ready[slot], 0));
+        nvtxRangePushA("overlap/comm_layer");
+        CUDACHECK(cudaEventRecord(layer_comm_start[slot], comm_stream));
+        NCCLCHECK(ncclAllReduce(layer->weight_grad_accum().data(),
+                                layer->weight_grad_accum().data(),
+                                layer->weight_grad_accum().size(),
+                                ncclFloat, ncclSum, comm, comm_stream));
+        NCCLCHECK(ncclAllReduce(layer->bias_grad_accum().data(),
+                                layer->bias_grad_accum().data(),
+                                layer->bias_grad_accum().size(),
+                                ncclFloat, ncclSum, comm, comm_stream));
+        CUDACHECK(cudaEventRecord(layer_comm_end[slot], comm_stream));
+        nvtxRangePop();
     };
 
     auto scale_and_step = [&]()
@@ -317,13 +184,19 @@ void train(int rank, int world_size, Dataset& train_data,
         const float scale = static_cast<float>(world_size * accum_steps);
         for (FFLayer *layer : model.layers())
         {
-            layer->weight_grads().div(scale, compute_stream);
-            layer->bias_grads().div(scale, compute_stream);
+            layer->weight_grad_accum().div(scale, compute_stream);
+            layer->bias_grad_accum().div(scale, compute_stream);
         }
 
-        optimizer.step(model.layer3(), compute_stream);
-        optimizer.step(model.layer2(), compute_stream);
-        optimizer.step(model.layer1(), compute_stream);
+        optimizer.step(model.layer3(),
+                       model.layer3().weight_grad_accum(),
+                       model.layer3().bias_grad_accum(), compute_stream);
+        optimizer.step(model.layer2(),
+                       model.layer2().weight_grad_accum(),
+                       model.layer2().bias_grad_accum(), compute_stream);
+        optimizer.step(model.layer1(),
+                       model.layer1().weight_grad_accum(),
+                       model.layer1().bias_grad_accum(), compute_stream);
     };
 
     for (int epoch = 0; epoch < epochs; ++epoch)
@@ -334,8 +207,8 @@ void train(int rank, int world_size, Dataset& train_data,
         data_loader.reset();
         model.reset_score();
 
-        CUDACHECK(cudaMemsetAsync(accum_buf.data(), 0,
-                                  accum_buf.bytes(), compute_stream));
+        for (FFLayer *layer : model.layers())
+            layer->zero_grad_accum(compute_stream);
 
         int batch_count = 0;
         int accum_count = 0;
@@ -369,9 +242,8 @@ void train(int rank, int world_size, Dataset& train_data,
                 nvtxRangePop();
 
                 nvtxRangePushA("sync/accumulate");
-                accumulate_stage(0);
-                accumulate_stage(1);
-                accumulate_stage(2);
+                for (FFLayer *layer : model.layers())
+                    layer->accumulate_grads(compute_stream);
                 nvtxRangePop();
 
                 CUDACHECK(cudaEventRecord(compute_end, compute_stream));
@@ -391,10 +263,10 @@ void train(int rank, int world_size, Dataset& train_data,
 
                 nvtxRangePushA("overlap/bwd_layer3_grads");
                 model.backward_layer3_grads();
-                accumulate_stage(0);
-                CUDACHECK(cudaEventRecord(stage_ready[0], compute_stream));
+                model.layer3().accumulate_grads(compute_stream);
+                CUDACHECK(cudaEventRecord(layer_ready[0], compute_stream));
                 nvtxRangePop();
-                launch_overlap_buckets(0, final_accum);
+                launch_overlap_layer(0, final_accum);
 
                 nvtxRangePushA("overlap/bwd_layer3_input");
                 model.backward_layer3_input();
@@ -402,10 +274,10 @@ void train(int rank, int world_size, Dataset& train_data,
 
                 nvtxRangePushA("overlap/bwd_layer2_grads");
                 model.backward_layer2_grads();
-                accumulate_stage(1);
-                CUDACHECK(cudaEventRecord(stage_ready[1], compute_stream));
+                model.layer2().accumulate_grads(compute_stream);
+                CUDACHECK(cudaEventRecord(layer_ready[1], compute_stream));
                 nvtxRangePop();
-                launch_overlap_buckets(1, final_accum);
+                launch_overlap_layer(1, final_accum);
 
                 nvtxRangePushA("overlap/bwd_layer2_input");
                 model.backward_layer2_input();
@@ -413,10 +285,10 @@ void train(int rank, int world_size, Dataset& train_data,
 
                 nvtxRangePushA("overlap/bwd_layer1_grads");
                 model.backward_layer1_grads();
-                accumulate_stage(2);
-                CUDACHECK(cudaEventRecord(stage_ready[2], compute_stream));
+                model.layer1().accumulate_grads(compute_stream);
+                CUDACHECK(cudaEventRecord(layer_ready[2], compute_stream));
                 nvtxRangePop();
-                launch_overlap_buckets(2, final_accum);
+                launch_overlap_layer(2, final_accum);
 
                 nvtxRangePushA("overlap/bwd_layer1_input");
                 model.backward_layer1_input();
@@ -438,16 +310,12 @@ void train(int rank, int world_size, Dataset& train_data,
 
             if (final_accum)
             {
-                nvtxRangePushA(mode == TrainMode::Overlap ? "overlap/unpack" : "sync/unpack");
-                unpack();
-                nvtxRangePop();
-
                 nvtxRangePushA(mode == TrainMode::Overlap ? "overlap/opt" : "sync/opt");
                 scale_and_step();
                 nvtxRangePop();
 
-                CUDACHECK(cudaMemsetAsync(accum_buf.data(), 0,
-                                          accum_buf.bytes(), compute_stream));
+                // sgd_update_kernel zeroes the grad accumulators as a side effect,
+                // so they are ready for the next accumulation period.
                 accum_count = 0;
             }
 
@@ -465,13 +333,19 @@ void train(int rank, int world_size, Dataset& train_data,
 
             if (final_accum)
             {
-                for (const GradBucket& bucket : buckets)
+                // In overlap mode the per-layer comm events live on comm_stream.
+                // Wait on comm_done explicitly so the elapsed-time reads below
+                // can never see a not-yet-completed event ("device not ready").
+                if (mode == TrainMode::Overlap)
+                    CUDACHECK(cudaEventSynchronize(comm_done));
+
+                for (int i = 0; i < 3; ++i)
                 {
-                    float bucket_ms = 0.0f;
-                    CUDACHECK(cudaEventElapsedTime(&bucket_ms,
-                                                  bucket.comm_start,
-                                                  bucket.comm_end));
-                    comm_total_ms += bucket_ms;
+                    float layer_ms = 0.0f;
+                    CUDACHECK(cudaEventElapsedTime(&layer_ms,
+                                                  layer_comm_start[i],
+                                                  layer_comm_end[i]));
+                    comm_total_ms += layer_ms;
                 }
 
                 if (mode == TrainMode::Overlap)
@@ -516,12 +390,12 @@ void train(int rank, int world_size, Dataset& train_data,
     CUDACHECK(cudaEventDestroy(wait_start));
     CUDACHECK(cudaEventDestroy(wait_end));
     CUDACHECK(cudaEventDestroy(comm_done));
-    for (cudaEvent_t& event : stage_ready)
+    for (cudaEvent_t& event : layer_ready)
         CUDACHECK(cudaEventDestroy(event));
-    for (GradBucket& bucket : buckets)
+    for (int i = 0; i < 3; ++i)
     {
-        CUDACHECK(cudaEventDestroy(bucket.comm_start));
-        CUDACHECK(cudaEventDestroy(bucket.comm_end));
+        CUDACHECK(cudaEventDestroy(layer_comm_start[i]));
+        CUDACHECK(cudaEventDestroy(layer_comm_end[i]));
     }
 
     if (rank == 0)
@@ -544,25 +418,23 @@ int main(int argc, char **argv)
         NCCLCHECK(ncclGetUniqueId(&id));
     MPICHECK(MPI_Bcast(&id, sizeof(id), MPI_BYTE, 0, MPI_COMM_WORLD));
 
-    // argv[1]: dataset     ("mnist" default | "cifar10")
-    // argv[2]: hidden_dim  (default 1024 for mnist, 4096 for cifar10)
-    // argv[3]: bucket_size (default -1: sync=one bucket, overlap=25 MiB buckets)
-    // argv[4]: accum_steps (default 1 = no accumulation)
-    // argv[5]: algo        ("ring", "tree", or omit to let NCCL decide)
-    // argv[6]: learning_rate (default 0.3 for mnist, 0.01 for cifar10)
-    // argv[7]: mode        ("overlap" default | "sync")
-    // argv[8]: epochs      (default 10)
+    // argv[1]: dataset       ("mnist" default | "cifar10")
+    // argv[2]: hidden_dim    (default 1024 for mnist, 4096 for cifar10)
+    // argv[3]: accum_steps   (default 1 = no accumulation)
+    // argv[4]: algo          ("ring", "tree", or omit to let NCCL decide)
+    // argv[5]: learning_rate (default 0.3 for mnist, 0.01 for cifar10)
+    // argv[6]: mode          ("overlap" default | "sync")
+    // argv[7]: epochs        (default 10)
     const char *dataset_arg = (argc >= 2) ? argv[1] : "mnist";
     bool use_cifar10 = (std::strcmp(dataset_arg, "cifar10") == 0);
     int default_hidden = use_cifar10 ? 4096 : 1024;
     int hidden_dim  = (argc >= 3) ? std::atoi(argv[2]) : default_hidden;
-    long long bucket_size = (argc >= 4) ? std::atoll(argv[3]) : -1;
-    int accum_steps = (argc >= 5) ? std::atoi(argv[4]) : 1;
-    const char *algo_arg = (argc >= 6) ? argv[5] : "auto";
+    int accum_steps = (argc >= 4) ? std::atoi(argv[3]) : 1;
+    const char *algo_arg = (argc >= 5) ? argv[4] : "auto";
     float default_lr = use_cifar10 ? 0.01f : 0.3f;
-    float learning_rate = (argc >= 7) ? std::atof(argv[6]) : default_lr;
-    const char *mode_arg = (argc >= 8) ? argv[7] : "overlap";
-    int epochs = (argc >= 9) ? std::atoi(argv[8]) : default_num_epochs;
+    float learning_rate = (argc >= 6) ? std::atof(argv[5]) : default_lr;
+    const char *mode_arg = (argc >= 7) ? argv[6] : "overlap";
+    int epochs = (argc >= 8) ? std::atoi(argv[7]) : default_num_epochs;
 
     TrainMode mode = TrainMode::Overlap;
     if (std::strcmp(mode_arg, "sync") == 0)
@@ -605,14 +477,14 @@ int main(int argc, char **argv)
         CIFAR10 train_data(std::string(data_dir) + "/cifar-10-batches-bin", true);
         train(rank, size, train_data, output_path, comm,
               CIFAR10::IMAGE_DIM, CIFAR10::NUM_CLASSES,
-              hidden_dim, bucket_size, accum_steps, algo_arg, learning_rate,
+              hidden_dim, accum_steps, algo_arg, learning_rate,
               mode, epochs);
     } else {
         MNIST train_data(std::string(data_dir) + "/train-images-idx3-ubyte",
                          std::string(data_dir) + "/train-labels-idx1-ubyte");
         train(rank, size, train_data, output_path, comm,
               MNIST::IMAGE_DIM, MNIST::NUM_CLASSES,
-              hidden_dim, bucket_size, accum_steps, algo_arg, learning_rate,
+              hidden_dim, accum_steps, algo_arg, learning_rate,
               mode, epochs);
     }
 

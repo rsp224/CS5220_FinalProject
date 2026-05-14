@@ -56,6 +56,14 @@ void SGDOptimizer::step(FFLayer& layer, cudaStream_t stream) {
     update_tensor(layer.biases(), layer.bias_grads(), learning_rate_, stream);
 }
 
+void SGDOptimizer::step(FFLayer& layer,
+                        Tensor& weight_grad,
+                        Tensor& bias_grad,
+                        cudaStream_t stream) {
+    update_tensor(layer.weights(), weight_grad, learning_rate_, stream);
+    update_tensor(layer.biases(), bias_grad, learning_rate_, stream);
+}
+
 float SGDOptimizer::learning_rate() const noexcept {
     return learning_rate_;
 }
