@@ -300,11 +300,12 @@ void train(int rank, int world_size, Dataset& train_data,
                 {
                     CUDACHECK(cudaEventRecord(comm_done, comm_stream));
 
-                    nvtxRangePushA("overlap/wait_comm");
                     CUDACHECK(cudaEventRecord(wait_start, compute_stream));
-                    CUDACHECK(cudaStreamWaitEvent(compute_stream, comm_done, 0));
-                    CUDACHECK(cudaEventRecord(wait_end, compute_stream));
+                    CUDACHECK(cudaEventSynchronize(wait_start));
+                    nvtxRangePushA("overlap/wait_comm");
+                    CUDACHECK(cudaEventSynchronize(comm_done));
                     nvtxRangePop();
+                    CUDACHECK(cudaEventRecord(wait_end, compute_stream));
                 }
             }
 
